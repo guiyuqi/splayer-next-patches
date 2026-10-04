@@ -1,0 +1,224 @@
+From acf064a3cd2079f6c9384d7cfb3e56ee9c9423e9 Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:48 +0800
+Subject: [PATCH 3/8] =?UTF-8?q?feat:=20=E6=AD=8C=E8=AF=8D=E6=94=AF?=
+ =?UTF-8?q?=E6=8C=81=E6=B0=B4=E5=B9=B3=E5=B1=85=E4=B8=AD=E4=B8=8E=E6=B0=B4?=
+ =?UTF-8?q?=E5=B9=B3=E5=81=8F=E7=A7=BB=E8=AE=BE=E7=BD=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/components/player/Lyrics/AMLLLyrics.vue   | 40 ++++++++++++++++-
+ .../player/Lyrics/DefaultLyrics.vue           | 43 ++++++++++++++++++-
+ src/components/player/Lyrics/index.vue        |  4 ++
+ src/stores/settings.ts                        |  2 +
+ 4 files changed, 86 insertions(+), 3 deletions(-)
+
+diff --git a/src/components/player/Lyrics/AMLLLyrics.vue b/src/components/player/Lyrics/AMLLLyrics.vue
+index 0ac4cc2..d80f118 100644
+--- a/src/components/player/Lyrics/AMLLLyrics.vue
++++ b/src/components/player/Lyrics/AMLLLyrics.vue
+@@ -18,6 +18,10 @@ const props = withDefaults(
+     playing?: boolean;
+     /** 激活行在容器中的对齐位置 [0 ~ 1] */
+     alignPosition?: number;
++    /** 歌词文本是否水平居中 */
++    alignCenter?: boolean;
++    /** 水平偏移（相对歌词区域宽度的百分比，负值向左） */
++    offsetX?: number;
+     /** 逐字掩码渐变宽度比例 */
+     wordFadeWidth?: number;
+     /** 是否隐藏已播放行 */
+@@ -40,6 +44,8 @@ const props = withDefaults(
+   {
+     playing: false,
+     alignPosition: 0.35,
++    alignCenter: false,
++    offsetX: 0,
+     wordFadeWidth: 0.5,
+     hidePassedLines: false,
+     enableBlur: false,
+@@ -52,6 +58,11 @@ const props = withDefaults(
+   },
+ );
+ 
++/** 水平偏移：按歌词区域宽度的百分比平移，值为 0 时不产生 transform */
++const offsetStyle = computed(() =>
++  props.offsetX ? { transform: `translateX(${props.offsetX}%)` } : undefined,
++);
++
+ interface Emits {
+   /** 点击歌词行进行播放进度跳转 */
+   (e: "seek", timeMs: number): void;
+@@ -84,14 +95,26 @@ const nextFrame = (): Promise<void> =>
+ // 处理多语言显隐及音译偏好的本地高效清洗
+ const processedLyrics = computed(() => {
+   if (!props.lyricLines) return [];
++  // AMLL 只在整曲每行词数均 ≤1 时走 non-dynamic 快速路径，此时逐词渲染被整体跳过，
++  // 逐词音译不会出现在任何元素里（库内部按未拆分的 words.length 判定，等价于此处判断）
++  const nonDynamic = props.lyricLines.every((line) => line.words.length <= 1);
+   return props.lyricLines.map((line) => {
+     const hasWordRoman = line.words.some((w) => Boolean(w.romanWord?.trim()));
+     const showWordRomanForLine = props.showWordRomanization && hasWordRoman;
+     const showLineRomanForLine = props.showRomanization && !showWordRomanForLine;
++    // 逐词音译无法渲染时回退到行级音译，优先用歌词自带的行级文本，缺失则由逐词音译拼回
++    const wordRomanFallback =
++      showWordRomanForLine && nonDynamic
++        ? line.romanLyric?.trim() ||
++          line.words
++            .map((w) => w.romanWord?.trim())
++            .filter(Boolean)
++            .join(" ")
++        : "";
+     const newLine = {
+       ...line,
+       translatedLyric: props.showTranslation ? line.translatedLyric : "",
+-      romanLyric: showLineRomanForLine ? line.romanLyric : "",
++      romanLyric: showLineRomanForLine ? line.romanLyric : wordRomanFallback,
+     };
+     if (line.words) {
+       newLine.words = line.words.map((word) => {
+@@ -371,7 +394,12 @@ defineExpose({
+ </script>
+ 
+ <template>
+-  <div ref="wrapperRef" class="amll-lyrics-container" :class="contentVisible ? 'is-visible' : ''" />
++  <div
++    ref="wrapperRef"
++    class="amll-lyrics-container"
++    :class="[contentVisible ? 'is-visible' : '', alignCenter ? 'is-align-center' : '']"
++    :style="offsetStyle"
++  />
+   <Teleport v-if="bottomLineEl" :to="bottomLineEl">
+     <slot name="bottom">
+       <LyricCredit />
+@@ -380,6 +408,14 @@ defineExpose({
+ </template>
+ 
+ <style scoped>
++/* 居中显示：作用于歌词行与主行；对唱行自带 text-align: right 属于自身声明，不受继承影响。
++   不再下沉到 span —— 库在 span 上为逐词罗马音/注音设了自己的对齐方式，覆盖会导致音译错位 */
++.amll-lyrics-container.is-align-center :deep([class*="lyricLine"]:not([class*="lyricDuetLine"])),
++.amll-lyrics-container.is-align-center
++  :deep([class*="lyricLine"]:not([class*="lyricDuetLine"]) [class*="lyricMainLine"]) {
++  text-align: center !important;
++}
++
+ .amll-lyrics-container {
+   width: 100%;
+   height: 100%;
+diff --git a/src/components/player/Lyrics/DefaultLyrics.vue b/src/components/player/Lyrics/DefaultLyrics.vue
+index dce5c7f..d700d40 100644
+--- a/src/components/player/Lyrics/DefaultLyrics.vue
++++ b/src/components/player/Lyrics/DefaultLyrics.vue
+@@ -16,6 +16,10 @@ const props = withDefaults(
+      * @default 0.35
+      */
+     alignPosition?: number;
++    /** 歌词文本是否水平居中 @default false */
++    alignCenter?: boolean;
++    /** 水平偏移（相对歌词区域宽度的百分比，负值向左）@default 0 */
++    offsetX?: number;
+     /**
+      * 逐字掩码渐变宽度比例（相对于文字高度）
+      * @range 0 ~ 1（0 = 硬切，1 = 全字高渐变）
+@@ -101,6 +105,8 @@ const props = withDefaults(
+   {
+     playing: false,
+     alignPosition: DEFAULTS.alignPosition,
++    alignCenter: false,
++    offsetX: 0,
+     wordFadeWidth: DEFAULTS.wordFadeWidth,
+     scrollResetDelay: DEFAULTS.scrollResetDelay,
+     minInterludeGap: DEFAULTS.minInterludeGap,
+@@ -123,6 +129,11 @@ const props = withDefaults(
+   },
+ );
+ 
++/** 水平偏移：按歌词区域宽度的百分比平移，值为 0 时不产生 transform */
++const offsetStyle = computed(() =>
++  props.offsetX ? { transform: `translateX(${props.offsetX}%)` } : undefined,
++);
++
+ interface Emits {
+   /** 用户点击歌词行时触发，参数为该行起始时间（毫秒），用于跳转播放进度 */
+   (e: "seek", timeMs: number): void;
+@@ -314,7 +325,7 @@ watch(
+ </script>
+ 
+ <template>
+-  <div ref="containerRef">
++  <div ref="containerRef" :class="alignCenter ? 'lyric-align-center' : ''" :style="offsetStyle">
+     <Teleport v-if="bottomLineEl" :to="bottomLineEl">
+       <slot name="bottom">
+         <LyricCredit />
+@@ -322,3 +333,33 @@ watch(
+     </Teleport>
+   </div>
+ </template>
++
++<style scoped>
++/* 居中显示：缩放原点改为居中，避免激活行从左边缘放大 */
++.lyric-align-center :deep(.lp-line) {
++  text-align: center;
++  transform-origin: center;
++}
++
++/* 行内容是 width: fit-content 的块级盒子，text-align 挪不动它；
++   库自身用 margin-left: auto 对齐对唱行，这里用同样方式居中普通行（对唱行保持右对齐） */
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-content) {
++  margin-inline: auto;
++}
++
++/* 显式覆盖各级容器：单一 text-align 会被中间层自身的对齐方式截断，导致换行行左起 */
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-content),
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-main),
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-sub),
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-line-bg) {
++  text-align: center !important;
++}
++
++/* 逐词音译盒子：库为每行首个词设了 `:first-child { text-align: left; align-items: flex-start }`
++   （左对齐布局下让音译贴住行首），整行为单词语时它必然命中，音译便被钉在左边缘。
++   居中模式下要连它一起覆盖；内部 .lp-word-text / .lp-roman-word 是 text-align: inherit，会跟随居中 */
++.lyric-align-center :deep(.lp-line:not(.duet) .lp-main > .lp-word-roman) {
++  text-align: center !important;
++  align-items: center;
++}
++</style>
+diff --git a/src/components/player/Lyrics/index.vue b/src/components/player/Lyrics/index.vue
+index 7bcbef9..f19bdb8 100644
+--- a/src/components/player/Lyrics/index.vue
++++ b/src/components/player/Lyrics/index.vue
+@@ -67,6 +67,8 @@ defineExpose({
+     :initial-time="props.initialTime"
+     :playing="props.playing"
+     :align-position="settings.lyric.alignPosition"
++    :align-center="settings.lyric.alignCenter"
++    :offset-x="settings.lyric.horizontalOffset"
+     :word-fade-width="settings.lyric.wordFadeWidth"
+     :hide-passed-lines="settings.lyric.hidePassedLines"
+     :enable-blur="settings.lyric.enableBlur"
+@@ -90,6 +92,8 @@ defineExpose({
+     :initial-time="props.initialTime"
+     :playing="props.playing"
+     :align-position="settings.lyric.alignPosition"
++    :align-center="settings.lyric.alignCenter"
++    :offset-x="settings.lyric.horizontalOffset"
+     :word-fade-width="settings.lyric.wordFadeWidth"
+     :spring-config="springConfig"
+     :inactive-alpha="settings.lyric.inactiveAlpha"
+diff --git a/src/stores/settings.ts b/src/stores/settings.ts
+index 842c212..3319f84 100644
+--- a/src/stores/settings.ts
++++ b/src/stores/settings.ts
+@@ -201,6 +201,8 @@ export const useSettingsStore = defineStore(
+       springDamping: 15,
+       springStiffness: 90,
+       alignPosition: 0.35,
++      alignCenter: false,
++      horizontalOffset: 0,
+       wordFadeWidth: 0.5,
+       inactiveAlpha: 0.2,
+       enableExcludeLyrics: true,

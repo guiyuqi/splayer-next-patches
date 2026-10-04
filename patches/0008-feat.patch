@@ -1,0 +1,2065 @@
+From b642b65263547ae66bb0c4a8d30d864364ce1e90 Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:48 +0800
+Subject: [PATCH 8/8] =?UTF-8?q?feat:=20=E6=92=AD=E5=AE=A2/=E7=94=B5?=
+ =?UTF-8?q?=E5=8F=B0=E5=AD=90=E7=B3=BB=E7=BB=9F=EF=BC=88=E5=8F=91=E7=8E=B0?=
+ =?UTF-8?q?=E3=80=81=E5=88=86=E7=B1=BB=E3=80=81=E8=AF=A6=E6=83=85=E3=80=81?=
+ =?UTF-8?q?=E8=AE=A2=E9=98=85=E3=80=81=E6=90=9C=E7=B4=A2=E3=80=81=E6=92=AD?=
+ =?UTF-8?q?=E6=94=BE=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ electron/main/apis/netease/index.ts           |   2 +
+ .../netease/modules/dj_category_recommend.ts  |  15 ++
+ .../main/apis/netease/modules/dj_catelist.ts  |  15 ++
+ .../main/apis/netease/modules/dj_detail.ts    |  16 ++
+ electron/main/apis/netease/modules/dj_hot.ts  |  22 ++
+ .../modules/dj_personalize_recommend.ts       |  20 ++
+ .../main/apis/netease/modules/dj_program.ts   |  26 ++
+ .../apis/netease/modules/dj_program_detail.ts |  16 ++
+ .../main/apis/netease/modules/dj_radio_hot.ts |  24 ++
+ .../main/apis/netease/modules/dj_recommend.ts |  15 ++
+ .../apis/netease/modules/dj_recommend_type.ts |  21 ++
+ electron/main/apis/netease/modules/dj_sub.ts  |  24 ++
+ .../main/apis/netease/modules/dj_sublist.ts   |  23 ++
+ .../main/apis/netease/modules/dj_toplist.ts   |  24 ++
+ electron/main/apis/netease/modules/index.ts   |  29 +++
+ shared/types/radio.ts                         |  64 +++++
+ shared/utils/radio.ts                         |  77 ++++++
+ src/apis/radio/netease.spec.ts                | 189 ++++++++++++++
+ src/apis/radio/netease.ts                     | 193 +++++++++++++++
+ src/apis/search/index.ts                      |  13 +-
+ src/apis/search/netease.ts                    |  17 +-
+ src/components/layout/sidebarNav.ts           |   2 +
+ src/components/list/SongList.vue              |  11 +-
+ .../collection/useCollectionSubscribe.ts      |  10 +-
+ src/layouts/MainLayout.vue                    |   1 +
+ src/pages/Collection.vue                      |   2 +-
+ src/pages/Favorites.vue                       |  15 +-
+ src/pages/Podcast.vue                         | 234 ++++++++++++++++++
+ src/pages/PodcastCategory.vue                 | 130 ++++++++++
+ src/pages/Search.vue                          |  33 ++-
+ src/router/index.ts                           |  10 +
+ src/services/collection/netease.ts            |  44 ++++
+ src/stores/user.ts                            |  16 +-
+ src/utils/format/radio.spec.ts                | 128 ++++++++++
+ src/utils/format/radio.ts                     |  19 ++
+ 35 files changed, 1484 insertions(+), 16 deletions(-)
+ create mode 100644 electron/main/apis/netease/modules/dj_category_recommend.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_catelist.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_detail.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_hot.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_personalize_recommend.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_program.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_program_detail.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_radio_hot.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_recommend.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_recommend_type.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_sub.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_sublist.ts
+ create mode 100644 electron/main/apis/netease/modules/dj_toplist.ts
+ create mode 100644 shared/types/radio.ts
+ create mode 100644 shared/utils/radio.ts
+ create mode 100644 src/apis/radio/netease.spec.ts
+ create mode 100644 src/apis/radio/netease.ts
+ create mode 100644 src/pages/Podcast.vue
+ create mode 100644 src/pages/PodcastCategory.vue
+ create mode 100644 src/utils/format/radio.spec.ts
+ create mode 100644 src/utils/format/radio.ts
+
+diff --git a/electron/main/apis/netease/index.ts b/electron/main/apis/netease/index.ts
+index bec4c86..b47d3df 100644
+--- a/electron/main/apis/netease/index.ts
++++ b/electron/main/apis/netease/index.ts
+@@ -75,6 +75,8 @@ const NON_CACHEABLE: ReadonlySet<string> = new Set([
+   "cloud_upload_check_v2",
+   "cloud_song_import",
+   "album_sub",
++  "dj_sub",
++  "dj_sublist",
+   "playmode_intelligence",
+   "personal_fm",
+   "fm_trash",
+diff --git a/electron/main/apis/netease/modules/dj_category_recommend.ts b/electron/main/apis/netease/modules/dj_category_recommend.ts
+new file mode 100644
+index 0000000..8c6f5c9
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_category_recommend.ts
+@@ -0,0 +1,15 @@
++/**
++ * 电台（播客）分类推荐（首页按分类分组）
++ *
++ * params: 无
++ *
++ * 响应：`{ code, data: [{ categoryId, categoryName, radios: [...] }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djCategoryRecommend: NeteaseModule = (query, request) =>
++  request("/api/djradio/home/category/recommend", {}, createOption(query, "weapi"));
++
++export default djCategoryRecommend;
+diff --git a/electron/main/apis/netease/modules/dj_catelist.ts b/electron/main/apis/netease/modules/dj_catelist.ts
+new file mode 100644
+index 0000000..b8d24d1
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_catelist.ts
+@@ -0,0 +1,15 @@
++/**
++ * 电台（播客）分类
++ *
++ * params: 无
++ *
++ * 响应：`{ code, categories: [{ id, name, pic56x56Url, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djCatelist: NeteaseModule = (query, request) =>
++  request("/api/djradio/category/get", {}, createOption(query, "weapi"));
++
++export default djCatelist;
+diff --git a/electron/main/apis/netease/modules/dj_detail.ts b/electron/main/apis/netease/modules/dj_detail.ts
+new file mode 100644
+index 0000000..5e1d954
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_detail.ts
+@@ -0,0 +1,16 @@
++/**
++ * 电台（播客）详情
++ *
++ * params:
++ * - rid  电台 id
++ *
++ * 响应：`{ code, data: { id, name, desc, picUrl, programCount, subCount, dj, ... } }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djDetail: NeteaseModule = (query, request) =>
++  request("/api/djradio/v2/get", { id: query.rid }, createOption(query, "weapi"));
++
++export default djDetail;
+diff --git a/electron/main/apis/netease/modules/dj_hot.ts b/electron/main/apis/netease/modules/dj_hot.ts
+new file mode 100644
+index 0000000..bcac694
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_hot.ts
+@@ -0,0 +1,22 @@
++/**
++ * 热门电台（不带分类）
++ *
++ * params:
++ * - limit   返回数量，默认 30
++ * - offset  偏移，默认 0
++ *
++ * 响应：`{ code, djRadios: [{ id, name, picUrl, programCount, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djHot: NeteaseModule = (query, request) => {
++  const data = {
++    limit: query.limit ?? 30,
++    offset: query.offset ?? 0,
++  };
++  return request("/api/djradio/hot/v1", data, createOption(query, "weapi"));
++};
++
++export default djHot;
+diff --git a/electron/main/apis/netease/modules/dj_personalize_recommend.ts b/electron/main/apis/netease/modules/dj_personalize_recommend.ts
+new file mode 100644
+index 0000000..2ee3ed7
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_personalize_recommend.ts
+@@ -0,0 +1,20 @@
++/**
++ * 电台（播客）个性推荐
++ *
++ * params:
++ * - limit  返回数量，默认 6
++ *
++ * 响应：`{ code, data: [{ id, name, picUrl, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djPersonalizeRecommend: NeteaseModule = (query, request) =>
++  request(
++    "/api/djradio/personalize/rcmd",
++    { limit: query.limit ?? 6 },
++    createOption(query, "weapi"),
++  );
++
++export default djPersonalizeRecommend;
+diff --git a/electron/main/apis/netease/modules/dj_program.ts b/electron/main/apis/netease/modules/dj_program.ts
+new file mode 100644
+index 0000000..f307a61
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_program.ts
+@@ -0,0 +1,26 @@
++/**
++ * 电台（播客）的节目列表
++ *
++ * params:
++ * - rid     电台 id
++ * - limit   返回数量，默认 30
++ * - offset  偏移，默认 0
++ * - asc     是否按时间正序（默认 false：最新在前）
++ *
++ * 响应：`{ code, programs: [{ id, name, mainSong, mainTrackId, duration, ... }], count, more }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djProgram: NeteaseModule = (query, request) => {
++  const data = {
++    radioId: query.rid,
++    limit: query.limit ?? 30,
++    offset: query.offset ?? 0,
++    asc: query.asc === true,
++  };
++  return request("/api/dj/program/byradio", data, createOption(query, "weapi"));
++};
++
++export default djProgram;
+diff --git a/electron/main/apis/netease/modules/dj_program_detail.ts b/electron/main/apis/netease/modules/dj_program_detail.ts
+new file mode 100644
+index 0000000..9ff7c2f
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_program_detail.ts
+@@ -0,0 +1,16 @@
++/**
++ * 电台节目详情
++ *
++ * params:
++ * - id  节目 id
++ *
++ * 响应：`{ code, data: { id, name, desc, duration, mainSong, mainTrackId, radio, ... }, program }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djProgramDetail: NeteaseModule = (query, request) =>
++  request("/api/dj/program/detail", { id: query.id }, createOption(query, "weapi"));
++
++export default djProgramDetail;
+diff --git a/electron/main/apis/netease/modules/dj_radio_hot.ts b/electron/main/apis/netease/modules/dj_radio_hot.ts
+new file mode 100644
+index 0000000..8955494
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_radio_hot.ts
+@@ -0,0 +1,24 @@
++/**
++ * 分类下的热门电台
++ *
++ * params:
++ * - cateId  分类 id（来自 dj_catelist）
++ * - limit   返回数量，默认 30
++ * - offset  偏移，默认 0
++ *
++ * 响应：`{ code, djRadios: [{ id, name, picUrl, programCount, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djRadioHot: NeteaseModule = (query, request) => {
++  const data = {
++    cateId: query.cateId,
++    limit: query.limit ?? 30,
++    offset: query.offset ?? 0,
++  };
++  return request("/api/djradio/hot", data, createOption(query, "weapi"));
++};
++
++export default djRadioHot;
+diff --git a/electron/main/apis/netease/modules/dj_recommend.ts b/electron/main/apis/netease/modules/dj_recommend.ts
+new file mode 100644
+index 0000000..7da1ce1
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_recommend.ts
+@@ -0,0 +1,15 @@
++/**
++ * 电台（播客）推荐
++ *
++ * params: 无
++ *
++ * 响应：`{ code, data: [{ id, name, picUrl, programCount, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djRecommend: NeteaseModule = (query, request) =>
++  request("/api/djradio/recommend/v1", {}, createOption(query, "weapi"));
++
++export default djRecommend;
+diff --git a/electron/main/apis/netease/modules/dj_recommend_type.ts b/electron/main/apis/netease/modules/dj_recommend_type.ts
+new file mode 100644
+index 0000000..03515a0
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_recommend_type.ts
+@@ -0,0 +1,21 @@
++/**
++ * 分类下的推荐电台（精选电台分类）
++ *
++ * params:
++ * - type  分类 id（来自 dj_catelist 的 id），常见值见下
++ *
++ * 常见分类：有声书 10001 / 知识技能 453050 / 商业财经 453051 / 人文历史 11 /
++ * 外语世界 13 / 亲子宝贝 14 / 创作|翻唱 2001 / 音乐故事 2 / 3D|电子 10002 /
++ * 相声曲艺 8 / 情感调频 3 / 美文读物 6 / 脱口秀 5 / 广播剧 7 / 二次元 3001 /
++ * 明星做主播 1 / 娱乐|影视 4 / 科技科学 453052 / 校园|教育 4001 / 旅途|城市 12
++ *
++ * 响应：`{ code, djRadios: [{ id, name, picUrl, programCount, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djRecommendType: NeteaseModule = (query, request) =>
++  request("/api/djradio/recommend", { cateId: query.type }, createOption(query, "weapi"));
++
++export default djRecommendType;
+diff --git a/electron/main/apis/netease/modules/dj_sub.ts b/electron/main/apis/netease/modules/dj_sub.ts
+new file mode 100644
+index 0000000..2c155e3
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_sub.ts
+@@ -0,0 +1,24 @@
++/**
++ * 订阅 / 取消订阅电台（播客）
++ *
++ * params:
++ * - rid  电台 id
++ * - t    1 订阅（默认）/ 0 或 2 取消订阅
++ *        仓库其它 `_sub` 模块用 1/2，前身 SPlayer 与网易云网页端用 1/0，这里两者都收
++ *
++ * 响应：`{ code }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djSub: NeteaseModule = (query, request) => {
++  const unsub = query.t === 0 || query.t === 2;
++  return request(
++    `/api/djradio/${unsub ? "unsub" : "sub"}`,
++    { id: query.rid },
++    createOption(query, "weapi"),
++  );
++};
++
++export default djSub;
+diff --git a/electron/main/apis/netease/modules/dj_sublist.ts b/electron/main/apis/netease/modules/dj_sublist.ts
+new file mode 100644
+index 0000000..309cceb
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_sublist.ts
+@@ -0,0 +1,23 @@
++/**
++ * 我订阅的电台（播客）列表
++ *
++ * params:
++ * - limit   返回数量，默认 30
++ * - offset  偏移，默认 0
++ *
++ * 响应：`{ code, djRadios: [{ id, name, picUrl, programCount, ... }], count, hasMore }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djSublist: NeteaseModule = (query, request) => {
++  const data = {
++    limit: query.limit ?? 30,
++    offset: query.offset ?? 0,
++    total: true,
++  };
++  return request("/api/djradio/get/subed", data, createOption(query, "weapi"));
++};
++
++export default djSublist;
+diff --git a/electron/main/apis/netease/modules/dj_toplist.ts b/electron/main/apis/netease/modules/dj_toplist.ts
+new file mode 100644
+index 0000000..3f336fa
+--- /dev/null
++++ b/electron/main/apis/netease/modules/dj_toplist.ts
+@@ -0,0 +1,24 @@
++/**
++ * 电台（播客）榜单
++ *
++ * params:
++ * - type    "new" 新晋榜 / "hot" 热门榜，默认 new
++ * - limit   返回数量，默认 100
++ * - offset  偏移，默认 0
++ *
++ * 响应：`{ code, toplist: [{ id, name, picUrl, programCount, ... }] }`
++ */
++
++import { createOption } from "../core/option";
++import type { NeteaseModule } from "../core/types";
++
++const djToplist: NeteaseModule = (query, request) => {
++  const data = {
++    limit: query.limit ?? 100,
++    offset: query.offset ?? 0,
++    type: query.type === "hot" ? "1" : "0",
++  };
++  return request("/api/djradio/toplist", data, createOption(query, "weapi"));
++};
++
++export default djToplist;
+diff --git a/electron/main/apis/netease/modules/index.ts b/electron/main/apis/netease/modules/index.ts
+index 6dd5f37..f2bbe0e 100644
+--- a/electron/main/apis/netease/modules/index.ts
++++ b/electron/main/apis/netease/modules/index.ts
+@@ -106,6 +106,21 @@ import album_sublist from "./album_sublist";
+ import artist_sub from "./artist_sub";
+ import artist_sublist from "./artist_sublist";
+ 
++// 电台（播客）
++import dj_catelist from "./dj_catelist";
++import dj_category_recommend from "./dj_category_recommend";
++import dj_detail from "./dj_detail";
++import dj_hot from "./dj_hot";
++import dj_personalize_recommend from "./dj_personalize_recommend";
++import dj_program from "./dj_program";
++import dj_program_detail from "./dj_program_detail";
++import dj_radio_hot from "./dj_radio_hot";
++import dj_recommend from "./dj_recommend";
++import dj_recommend_type from "./dj_recommend_type";
++import dj_sub from "./dj_sub";
++import dj_sublist from "./dj_sublist";
++import dj_toplist from "./dj_toplist";
++
+ export const modules: Record<string, NeteaseModule> = {
+   captcha_sent,
+   captcha_verify,
+@@ -196,4 +211,18 @@ export const modules: Record<string, NeteaseModule> = {
+   album_sublist,
+   artist_sub,
+   artist_sublist,
++
++  dj_catelist,
++  dj_recommend,
++  dj_personalize_recommend,
++  dj_toplist,
++  dj_hot,
++  dj_category_recommend,
++  dj_radio_hot,
++  dj_recommend_type,
++  dj_detail,
++  dj_program,
++  dj_program_detail,
++  dj_sub,
++  dj_sublist,
+ };
+diff --git a/shared/types/radio.ts b/shared/types/radio.ts
+new file mode 100644
+index 0000000..a646d3f
+--- /dev/null
++++ b/shared/types/radio.ts
+@@ -0,0 +1,64 @@
++/**
++ * 网易云电台（播客）原始响应类型
++ *
++ * 跨进程共用（主进程 MCP 工具与渲染层都要做同样的映射）；
++ * 只列用得到的字段，接口字段可选且命名不统一（picUrl / coverUrl / interPicUrl），映射层负责兜底
++ */
++
++/** 电台（播客）作者/主播 */
++export interface NeteaseDjHost {
++  userId?: number | string;
++  nickname?: string;
++}
++
++/** 电台（播客）条目：/dj/toplist、/dj/hot、/dj/sublist、/dj/detail 的 data */
++export interface NeteaseDjRadio {
++  id: number | string;
++  name: string;
++  /** 封面（列表接口叫 picUrl，详情接口可能叫 interPicUrl） */
++  picUrl?: string;
++  interPicUrl?: string;
++  coverUrl?: string;
++  desc?: string;
++  rcmdtext?: string;
++  programCount?: number;
++  subCount?: number;
++  playCount?: number;
++  category?: string;
++  categoryId?: number | string;
++  /** 当前账号是否已订阅（仅详情接口返回） */
++  subed?: boolean;
++  dj?: NeteaseDjHost;
++  creatorName?: string;
++}
++
++/** 节目里的主歌曲（电台节目播放时真正取址用的 song） */
++export interface NeteaseDjMainSong {
++  id?: number | string;
++  name?: string;
++  fee?: number;
++  duration?: number;
++  dt?: number;
++  ar?: { id?: number | string; name?: string }[];
++  artists?: { id?: number | string; name?: string }[];
++  al?: { id?: number | string; name?: string; picUrl?: string };
++  album?: { id?: number | string; name?: string; picUrl?: string };
++}
++
++/** 电台节目（单集）：/dj/program、/dj/program/detail 的元素 */
++export interface NeteaseDjProgram {
++  id: number | string;
++  name: string;
++  duration?: number;
++  createTime?: number;
++  listenerCount?: number;
++  /** 期数 */
++  serialNum?: number;
++  coverUrl?: string;
++  blurCoverUrl?: string;
++  description?: string;
++  programDesc?: string;
++  mainTrackId?: number | string;
++  mainSong?: NeteaseDjMainSong;
++  radio?: NeteaseDjRadio;
++}
+diff --git a/shared/utils/radio.ts b/shared/utils/radio.ts
+new file mode 100644
+index 0000000..2e9e009
+--- /dev/null
++++ b/shared/utils/radio.ts
+@@ -0,0 +1,77 @@
++import type { Artist, Playlist, Track } from "@shared/types/player";
++import { withPicSize } from "@shared/utils/netease";
++import type { NeteaseDjProgram, NeteaseDjRadio } from "@shared/types/radio";
++
++/**
++ * 电台（播客）映射：主进程与渲染层共用
++ *
++ * 三个关键约定（打卡按它们判定 `resourceType: "dj"`，见 shared/utils/neteaseScrobble.ts）：
++ * 播放取址只认 `Track.id = mainSong.id`、`Track.extId = 节目 id`、`Track.album.id = 电台 id`
++ */
++
++/**
++ * 电台封面（列表接口叫 picUrl，详情接口可能叫 interPicUrl）
++ * @param raw - 电台原始条目
++ * @returns 带尺寸参数的封面地址
++ */
++export const djRadioCover = (raw?: NeteaseDjRadio): string | undefined =>
++  raw ? withPicSize(raw.picUrl ?? raw.interPicUrl ?? raw.coverUrl) : undefined;
++
++/**
++ * 电台（播客）原始条目 → 应用层 Playlist
++ *
++ * 复用 Playlist 承载电台：`trackCount` 语义是「节目数」，`owner` 是主播昵称
++ * @param raw - /dj/toplist、/dj/hot、/dj/sublist 等接口的元素
++ * @returns 应用层 Playlist
++ */
++export const toDjRadio = (raw: NeteaseDjRadio): Playlist => ({
++  id: String(raw.id),
++  name: raw.name,
++  cover: djRadioCover(raw),
++  description: raw.desc ?? raw.rcmdtext,
++  trackCount: raw.programCount,
++  owner: raw.dj?.nickname ?? raw.creatorName,
++});
++
++/**
++ * 节目（单集）→ 可播放 Track
++ *
++ * 三个关键约定（打卡链路按它们判定 `resourceType: "dj"`，见 shared/utils/neteaseScrobble.ts）：
++ * - `id` 取 `mainSong.id`（播放取址只认 track.id）
++ * - `extId` 取节目 id
++ * - `album.id` 取电台 id
++ *
++ * @param program - /dj/program、/dj/program/detail 的元素
++ * @param radio - 节目所属电台（部分接口只在 program.radio 上带）
++ * @returns 可播放 Track；缺失主歌曲时为 null
++ */
++export const programToTrack = (program: NeteaseDjProgram, radio?: NeteaseDjRadio): Track | null => {
++  const song = program.mainSong;
++  const show = radio ?? program.radio;
++  const trackId = song?.id ?? program.mainTrackId;
++  if (trackId == null) return null;
++
++  const rawArtists = song?.ar ?? song?.artists ?? [];
++  const artists: Artist[] = rawArtists
++    .filter((artist) => artist?.name)
++    .map((artist) => ({
++      id: artist.id == null ? undefined : String(artist.id),
++      name: artist.name as string,
++    }));
++  if (artists.length === 0 && show?.name) artists.push({ name: show.name });
++
++  const cover = withPicSize(program.coverUrl ?? program.blurCoverUrl) ?? djRadioCover(show);
++
++  return {
++    id: String(trackId),
++    extId: String(program.id),
++    source: "netease",
++    title: program.name || song?.name || "",
++    artists,
++    album: show ? { id: String(show.id), name: show.name, cover: djRadioCover(show) } : undefined,
++    duration: program.duration ?? song?.duration ?? song?.dt ?? 0,
++    cover,
++    coverOriginal: withPicSize(program.coverUrl, 1024) ?? withPicSize(show?.picUrl, 1024),
++    fee: (song?.fee ?? 0) as Track["fee"],
++  };
++};
+diff --git a/src/apis/radio/netease.spec.ts b/src/apis/radio/netease.spec.ts
+new file mode 100644
+index 0000000..a8cafca
+--- /dev/null
++++ b/src/apis/radio/netease.spec.ts
+@@ -0,0 +1,189 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { Track } from "@shared/types/player";
++import type { NeteaseDjProgram, NeteaseDjRadio } from "@shared/types/radio";
++
++// 渲染层的 netease Proxy 直接把 body 交给调用方（不是 { status, body }），mock 同样只回 body
++const mocks = vi.hoisted(() => ({
++  dj_catelist: vi.fn(),
++  dj_toplist: vi.fn(),
++  dj_sublist: vi.fn(),
++  dj_detail: vi.fn(),
++  dj_program: vi.fn(),
++  dj_program_detail: vi.fn(),
++  dj_sub: vi.fn(),
++  dj_category_recommend: vi.fn(),
++  dj_radio_hot: vi.fn(),
++  dj_recommend_type: vi.fn(),
++}));
++
++vi.mock("@/apis/netease", () => ({ netease: mocks }));
++
++const { fetchRadio, fetchRadioCategories, fetchRadioToplist, fetchUserRadios, subscribeRadio } =
++  await import("./netease");
++
++const radio: NeteaseDjRadio = {
++  id: 972022490,
++  name: "清音悦耳",
++  picUrl: "https://p1.music.126.net/cover.jpg",
++  programCount: 450,
++  dj: { nickname: "清尘伊笑" },
++};
++
++/** 造一页节目 */
++const page = (count: number, from = 0): NeteaseDjProgram[] =>
++  Array.from({ length: count }, (_, i) => ({
++    id: 1000 + from + i,
++    name: `第 ${from + i + 1} 集`,
++    duration: 60000,
++    mainTrackId: 5000 + from + i,
++    mainSong: { id: 5000 + from + i, name: `第 ${from + i + 1} 集`, fee: 0 },
++  }));
++
++/** 模拟风控错误（NeteaseRequestError 的形状） */
++const throttled = (): Error =>
++  Object.assign(new Error("netease 406: 操作频繁，请稍候再试"), {
++    name: "NeteaseRequestError",
++    response: { status: 406, body: { code: 406 } },
++  });
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  mocks.dj_detail.mockResolvedValue({ code: 200, data: radio });
++});
++
++describe("电台订阅", () => {
++  it("true 传 t=1、false 传 t=0，并校验响应 code", async () => {
++    mocks.dj_sub.mockResolvedValue({ code: 200 });
++
++    await subscribeRadio("972022490", true);
++    await subscribeRadio("972022490", false);
++
++    expect(mocks.dj_sub.mock.calls[0][0]).toEqual({ rid: "972022490", t: 1 });
++    expect(mocks.dj_sub.mock.calls[1][0]).toEqual({ rid: "972022490", t: 0 });
++  });
++
++  it("服务端 code 非 200 时抛出错误信息", async () => {
++    mocks.dj_sub.mockResolvedValue({ code: 301, msg: "需要登录" });
++
++    await expect(subscribeRadio("1", true)).rejects.toThrow("需要登录");
++  });
++});
++
++describe("电台列表映射", () => {
++  it("分类映射出 id/name", async () => {
++    mocks.dj_catelist.mockResolvedValue({
++      code: 200,
++      categories: [
++        { id: 3, name: "情感" },
++        { id: 2, name: "音乐播客" },
++      ],
++    });
++
++    expect(await fetchRadioCategories()).toEqual([
++      { id: 3, name: "情感" },
++      { id: 2, name: "音乐播客" },
++    ]);
++  });
++
++  it("热门榜映射成 Playlist（封面补参数、主播进 owner）", async () => {
++    mocks.dj_toplist.mockResolvedValue({ code: 200, toplist: [radio] });
++
++    expect(await fetchRadioToplist("hot", 5)).toEqual([
++      {
++        id: "972022490",
++        name: "清音悦耳",
++        cover: "https://p1.music.126.net/cover.jpg?param=300y300",
++        description: undefined,
++        trackCount: 450,
++        owner: "清尘伊笑",
++      },
++    ]);
++    expect(mocks.dj_toplist.mock.calls[0][0]).toMatchObject({ type: "hot", limit: 5 });
++  });
++
++  it("订阅列表分页拉全量（首页满页则继续）", async () => {
++    const full = Array.from({ length: 100 }, (_, i) => ({ ...radio, id: i + 1 }));
++    mocks.dj_sublist
++      .mockResolvedValueOnce({ code: 200, djRadios: full })
++      .mockResolvedValueOnce({ code: 200, djRadios: full.slice(0, 3) });
++
++    const podcasts = await fetchUserRadios();
++
++    expect(mocks.dj_sublist).toHaveBeenCalledTimes(2);
++    expect(mocks.dj_sublist.mock.calls[1][0]).toMatchObject({ offset: 100 });
++    expect(podcasts).toHaveLength(103);
++    expect(podcasts[0]).toMatchObject({ id: "1", name: "清音悦耳", owner: "清尘伊笑" });
++  });
++});
++
++describe("电台节目分页", () => {
++  it("按 200/页 拉取，元数据先回调、节目分批回调，末页不足即停", async () => {
++    mocks.dj_program
++      .mockResolvedValueOnce({ code: 200, programs: page(200, 0), count: 450 })
++      .mockResolvedValueOnce({ code: 200, programs: page(50, 200), count: 450 });
++
++    const meta: string[] = [];
++    const batches: Track[][] = [];
++    await fetchRadio("972022490", {
++      onMeta: (item) => meta.push(item.name),
++      onBatch: (batch) => batches.push(batch),
++    });
++
++    expect(meta).toEqual(["清音悦耳"]);
++    expect(batches.map((batch) => batch.length)).toEqual([200, 50]);
++    expect(mocks.dj_program.mock.calls[0][0]).toMatchObject({
++      rid: "972022490",
++      limit: 200,
++      offset: 0,
++    });
++    expect(mocks.dj_program.mock.calls[1][0]).toMatchObject({ offset: 200 });
++    // 每集都带节目 id（extId）与电台 id（album.id），打卡才认得出是播客
++    expect(batches[0][0]).toMatchObject({
++      id: "5000",
++      extId: "1000",
++      album: { id: "972022490", name: "清音悦耳" },
++      title: "第 1 集",
++      duration: 60000,
++    });
++  });
++
++  it("命中风控时等待后重试一次", async () => {
++    mocks.dj_program
++      .mockRejectedValueOnce(throttled())
++      .mockResolvedValueOnce({ code: 200, programs: page(2, 0) });
++
++    const batches: Track[][] = [];
++    await fetchRadio("972022490", { onBatch: (batch) => batches.push(batch) });
++
++    expect(mocks.dj_program).toHaveBeenCalledTimes(2);
++    expect(batches.map((batch) => batch.length)).toEqual([2]);
++  });
++
++  it("首页失败向上抛", async () => {
++    mocks.dj_program.mockRejectedValue(throttled());
++
++    await expect(fetchRadio("972022490", {})).rejects.toThrow("操作频繁");
++  });
++
++  it("后续页失败只截断尾部，保留已加载节目", async () => {
++    mocks.dj_program
++      .mockResolvedValueOnce({ code: 200, programs: page(200, 0) })
++      .mockRejectedValue(throttled());
++
++    const batches: Track[][] = [];
++    await expect(
++      fetchRadio("972022490", { onBatch: (batch) => batches.push(batch) }),
++    ).resolves.toBeUndefined();
++    expect(batches.map((batch) => batch.length)).toEqual([200]);
++  });
++
++  it("中断信号生效时不拉节目", async () => {
++    const controller = new AbortController();
++    controller.abort();
++
++    await fetchRadio("972022490", { signal: controller.signal });
++
++    expect(mocks.dj_detail).not.toHaveBeenCalled();
++    expect(mocks.dj_program).not.toHaveBeenCalled();
++  });
++});
+diff --git a/src/apis/radio/netease.ts b/src/apis/radio/netease.ts
+new file mode 100644
+index 0000000..5c581b0
+--- /dev/null
++++ b/src/apis/radio/netease.ts
+@@ -0,0 +1,193 @@
++import type { Playlist, Track } from "@shared/types/player";
++import { netease as neteaseApi } from "@/apis/netease";
++import { ensureOk } from "@/utils/format/netease";
++import { programToTrack, toDjRadio } from "@/utils/format/radio";
++import type { NeteaseDjProgram, NeteaseDjRadio } from "@shared/types/radio";
++
++/** 节目列表单页条数（接口上限约 200） */
++const PROGRAM_PAGE_SIZE = 200;
++/** 节目分页之间的间隔，连续请求会触发网易云 405/406 风控 */
++const PROGRAM_PAGE_DELAY_MS = 400;
++/** 命中风控后的重试等待 */
++const PROGRAM_RETRY_DELAY_MS = 1200;
++/** 节目分页安全上限（防接口异常导致死循环，正常电台远达不到） */
++const PROGRAM_MAX = 5000;
++/** 订阅列表单页条数与安全上限 */
++const SUBLIST_PAGE_SIZE = 100;
++const SUBLIST_MAX = 2000;
++
++/** 电台分类 */
++export interface RadioCategory {
++  id: number;
++  name: string;
++}
++
++/** 分类推荐分组（首页「按分类推荐」） */
++export interface RadioCategoryGroup {
++  id: number;
++  name: string;
++  radios: Playlist[];
++}
++
++/** fetchRadio 的可选参数 */
++export interface FetchRadioOptions {
++  /** 元数据回调 */
++  onMeta?: (radio: Playlist) => void;
++  /** 节目分批回调 */
++  onBatch?: (batch: Track[]) => void;
++  /** 中断信号 */
++  signal?: AbortSignal;
++}
++
++/** 电台分类列表（/dj/catelist） */
++export const fetchRadioCategories = async (): Promise<RadioCategory[]> => {
++  const body = await neteaseApi.dj_catelist();
++  return ((body?.categories ?? []) as RadioCategory[]).map((item) => ({
++    id: Number(item.id),
++    name: item.name,
++  }));
++};
++
++/**
++ * 热门电台榜（/dj/toplist）
++ * @param type - new 新晋榜 / hot 热门榜
++ * @param limit - 返回数量
++ */
++export const fetchRadioToplist = async (
++  type: "new" | "hot" = "hot",
++  limit = 30,
++): Promise<Playlist[]> => {
++  const body = await neteaseApi.dj_toplist({ type, limit, offset: 0 });
++  return ((body?.toplist ?? []) as NeteaseDjRadio[]).map(toDjRadio);
++};
++
++/** 分类推荐分组（/dj/category/recommend） */
++export const fetchRadioCategoryRecommend = async (): Promise<RadioCategoryGroup[]> => {
++  const body = await neteaseApi.dj_category_recommend();
++  const groups = (body?.data ?? []) as {
++    categoryId: number;
++    categoryName: string;
++    radios?: NeteaseDjRadio[];
++  }[];
++  return groups.map((group) => ({
++    id: Number(group.categoryId),
++    name: group.categoryName,
++    radios: (group.radios ?? []).map(toDjRadio),
++  }));
++};
++
++/**
++ * 分类下的热门电台（/dj/radio/hot）
++ * @param cateId - 分类 id
++ * @param limit - 返回数量
++ */
++export const fetchRadioCategoryHot = async (cateId: number, limit = 30): Promise<Playlist[]> => {
++  const body = await neteaseApi.dj_radio_hot({ cateId, limit, offset: 0 });
++  return ((body?.djRadios ?? []) as NeteaseDjRadio[]).map(toDjRadio);
++};
++
++/**
++ * 分类下的推荐电台（/dj/recommend/type）
++ * @param type - 分类 id
++ */
++export const fetchRadioRecommendByCategory = async (type: number): Promise<Playlist[]> => {
++  const body = await neteaseApi.dj_recommend_type({ type });
++  return ((body?.djRadios ?? []) as NeteaseDjRadio[]).map(toDjRadio);
++};
++
++/** 我订阅的电台（/dj/sublist），分页拉全量 */
++export const fetchUserRadios = async (): Promise<Playlist[]> => {
++  const all: Playlist[] = [];
++  for (let offset = 0; offset < SUBLIST_MAX; offset += SUBLIST_PAGE_SIZE) {
++    const body = await neteaseApi.dj_sublist({ limit: SUBLIST_PAGE_SIZE, offset });
++    const page = ((body?.djRadios ?? []) as NeteaseDjRadio[]).map(toDjRadio);
++    all.push(...page);
++    if (page.length < SUBLIST_PAGE_SIZE) break;
++  }
++  return all;
++};
++
++/** 判断是否为网易云风控限流（405/406 操作频繁） */
++const isThrottled = (error: unknown): boolean => {
++  const status = (error as { response?: { status?: number } })?.response?.status;
++  if (status === 405 || status === 406) return true;
++  return error instanceof Error && /netease 40[56]/.test(error.message);
++};
++
++/**
++ * 拉一页节目，遇到风控等待后重试一次
++ * @param rid - 电台 id
++ * @param offset - 偏移
++ * @returns 节目原始数组
++ */
++const fetchProgramPage = async (rid: string, offset: number): Promise<NeteaseDjProgram[]> => {
++  const query = { rid, limit: PROGRAM_PAGE_SIZE, offset, asc: false };
++  try {
++    const body = await neteaseApi.dj_program(query);
++    return (body?.programs ?? []) as NeteaseDjProgram[];
++  } catch (error) {
++    if (!isThrottled(error)) throw error;
++    await new Promise((resolve) => setTimeout(resolve, PROGRAM_RETRY_DELAY_MS));
++    const body = await neteaseApi.dj_program(query);
++    return (body?.programs ?? []) as NeteaseDjProgram[];
++  }
++};
++
++/**
++ * 拉取电台：元数据 + 节目（分页流式回调）
++ *
++ * 详情接口只给元数据，节目要按 `dj/program` 分页拉；大电台（上千集）边拉边上屏，
++ * 因此沿用与歌单一致的 onMeta/onBatch 契约。首页之后的限流失败只截断尾部，
++ * 不把已经拿到的节目丢掉。
++ * @param rid - 电台 id
++ * @param options - 元数据/节目回调与中断信号
++ */
++export const fetchRadio = async (rid: string, options: FetchRadioOptions = {}): Promise<void> => {
++  if (options.signal?.aborted) return;
++  const detail = await neteaseApi.dj_detail({ rid });
++  if (options.signal?.aborted) return;
++  const rawRadio = detail?.data as NeteaseDjRadio | undefined;
++  if (!rawRadio) return;
++  options.onMeta?.(toDjRadio(rawRadio));
++
++  const total = Math.min(Number(rawRadio.programCount) || PROGRAM_MAX, PROGRAM_MAX);
++  for (let offset = 0; offset < total; offset += PROGRAM_PAGE_SIZE) {
++    if (options.signal?.aborted) return;
++    // 连续大分页会触发风控，页间留一点间隔
++    if (offset > 0) await new Promise((resolve) => setTimeout(resolve, PROGRAM_PAGE_DELAY_MS));
++    let programs: NeteaseDjProgram[];
++    try {
++      programs = await fetchProgramPage(rid, offset);
++    } catch (error) {
++      // 第一页失败说明整体不可用，向上抛；后续页失败只截断尾部
++      if (offset === 0) throw error;
++      console.warn("[radio] 节目分页中断，已加载部分节目", error);
++      return;
++    }
++    if (options.signal?.aborted) return;
++    const batch = programs
++      .map((program) => programToTrack(program, rawRadio))
++      .filter((track): track is Track => track !== null);
++    if (batch.length > 0) options.onBatch?.(batch);
++    if (programs.length < PROGRAM_PAGE_SIZE) break;
++  }
++};
++
++/**
++ * 单个节目的曲目（用于「单集播放」，如搜索结果里的单集）
++ * @param programId - 节目 id
++ */
++export const fetchProgramTrack = async (programId: string): Promise<Track | null> => {
++  const body = await neteaseApi.dj_program_detail({ id: programId });
++  const program = body?.program as NeteaseDjProgram | undefined;
++  return program ? programToTrack(program) : null;
++};
++
++/**
++ * 订阅 / 取消订阅电台
++ * @param rid - 电台 id
++ * @param subscribe - true 订阅 / false 取消
++ */
++export const subscribeRadio = async (rid: string, subscribe: boolean): Promise<void> => {
++  ensureOk(await neteaseApi.dj_sub({ rid, t: subscribe ? 1 : 0 }));
++};
+diff --git a/src/apis/search/index.ts b/src/apis/search/index.ts
+index bb0ba0b..844bc50 100644
+--- a/src/apis/search/index.ts
++++ b/src/apis/search/index.ts
+@@ -1,6 +1,6 @@
+ /**
+  * 在线平台搜索分发
+- * 对外暴露 searchSongs / searchAlbums / searchArtists / searchPlaylists
++ * 对外暴露 searchSongs / searchAlbums / searchArtists / searchPlaylists / searchRadios
+  */
+ 
+ import type { Track } from "@shared/types/player";
+@@ -72,3 +72,14 @@ export const searchPlaylists = (
+   if (platform === "kugou") return kugou.playlists(keyword, offset, limit);
+   return unsupported(platform, "playlists");
+ };
++
++/** 搜索播客（仅网易云提供电台搜索） */
++export const searchRadios = (
++  platform: Platform,
++  keyword: string,
++  offset: number,
++  limit: number,
++): Promise<SearchResult<CoverItem>> => {
++  if (platform === "netease") return netease.radios(keyword, offset, limit);
++  return unsupported(platform, "radios");
++};
+diff --git a/src/apis/search/netease.ts b/src/apis/search/netease.ts
+index d1b2a34..53e6570 100644
+--- a/src/apis/search/netease.ts
++++ b/src/apis/search/netease.ts
+@@ -1,8 +1,10 @@
+ import type { Track } from "@shared/types/player";
+ import type { CoverItem } from "@/types/artist";
+ import type { NeteaseSong } from "@/types/netease";
++import type { NeteaseDjRadio } from "@shared/types/radio";
+ import { netease as neteaseApi } from "@/apis/netease";
+ import { songsToTracks, withPicSize } from "@/utils/format/netease";
++import { djRadioToCoverItem, toDjRadio } from "@/utils/format/radio";
+ import type { SearchResult } from "./index";
+ 
+ interface NeteaseAlbum {
+@@ -33,15 +35,17 @@ interface CloudSearchBody {
+     albums?: NeteaseAlbum[];
+     artists?: NeteaseArtist[];
+     playlists?: NeteasePlaylist[];
++    djRadios?: NeteaseDjRadio[];
+     songCount?: number;
+     albumCount?: number;
+     artistCount?: number;
+     playlistCount?: number;
++    djRadiosCount?: number;
+   };
+ }
+ 
+ /** cloudsearch type 编码 */
+-const TYPE = { songs: 1, albums: 10, artists: 100, playlists: 1000 } as const;
++const TYPE = { songs: 1, albums: 10, artists: 100, playlists: 1000, radios: 1009 } as const;
+ 
+ const call = (
+   type: keyof typeof TYPE,
+@@ -123,3 +127,14 @@ export const playlists = async (
+   const total = body?.result?.playlistCount ?? items.length;
+   return { items, total, hasMore: offset + items.length < total };
+ };
++
++export const radios = async (
++  keyword: string,
++  offset: number,
++  limit: number,
++): Promise<SearchResult<CoverItem>> => {
++  const body = await call("radios", keyword, offset, limit);
++  const items = (body?.result?.djRadios ?? []).map((radio) => djRadioToCoverItem(toDjRadio(radio)));
++  const total = body?.result?.djRadiosCount ?? items.length;
++  return { items, total, hasMore: offset + items.length < total };
++};
+diff --git a/src/components/layout/sidebarNav.ts b/src/components/layout/sidebarNav.ts
+index 99993dc..d2e9dcf 100644
+--- a/src/components/layout/sidebarNav.ts
++++ b/src/components/layout/sidebarNav.ts
+@@ -6,6 +6,7 @@ import IconLucideDisc3 from "~icons/lucide/disc-3";
+ import IconLucideFolder from "~icons/lucide/folder";
+ import IconLucideChartPie from "~icons/lucide/chart-pie";
+ import IconLucideLibrary from "~icons/lucide/library";
++import IconLucideRadio from "~icons/lucide/radio";
+ import IconMaterialSymbolsFavoriteOutline from "~icons/material-symbols/favorite-outline-rounded";
+ import IconLucideStar from "~icons/lucide/star";
+ import IconLucideHistory from "~icons/lucide/history";
+@@ -37,6 +38,7 @@ const SIDEBAR_NAV_ENTRIES: SidebarNavEntry[] = [
+     hideable: true,
+   },
+   { key: "/favorites", labelKey: "nav.favorites", icon: IconLucideStar, hideable: true },
++  { key: "/podcast", labelKey: "nav.podcast", icon: IconLucideRadio, hideable: true },
+   { key: "/cloud", labelKey: "nav.cloud", icon: IconLucideCloud, hideable: true },
+   { key: "/download", labelKey: "nav.download", icon: IconLucideDownload, hideable: true },
+   { key: "/streaming", labelKey: "nav.streaming", icon: IconLucideLibrary, hideable: true },
+diff --git a/src/components/list/SongList.vue b/src/components/list/SongList.vue
+index 3adfd4e..1894f27 100644
+--- a/src/components/list/SongList.vue
++++ b/src/components/list/SongList.vue
+@@ -218,6 +218,9 @@ const onScroll = (event: Event): void => {
+   emit("scroll", event);
+ };
+ 
++/** 电台（播客）节目不显示红心/操作列：与前身 SPlayer 一致 */
++const hideActions = computed(() => props.collectionType === "radio");
++
+ /** 批量操作 */
+ const batch = useMultiSelect(sortedItems, {
+   source: computed(() => props.source),
+@@ -520,7 +523,9 @@ defineExpose({
+                 </div>
+               </div>
+               <div v-if="showAlbum" class="flex-1 min-w-0">{{ t("songList.album") }}</div>
+-              <div class="w-7 shrink-0 text-center">{{ t("songList.actions") }}</div>
++              <div v-if="!hideActions" class="w-7 shrink-0 text-center">
++                {{ t("songList.actions") }}
++              </div>
+               <div v-if="showDuration" class="w-16 shrink-0 text-center">
+                 {{ t("songList.duration") }}
+               </div>
+@@ -688,9 +693,9 @@ defineExpose({
+                   {{ item.album?.name || t("collection.unknownAlbum") }}
+                 </span>
+               </div>
+-              <!-- 红心：批量模式下隐藏，其余始终显示 -->
++              <!-- 红心：批量模式与电台（播客）节目下隐藏，其余始终显示 -->
+               <div
+-                v-if="!batch.active.value"
++                v-if="!batch.active.value && !hideActions"
+                 class="w-7 shrink-0 flex items-center justify-center"
+                 @click.stop
+               >
+diff --git a/src/composables/collection/useCollectionSubscribe.ts b/src/composables/collection/useCollectionSubscribe.ts
+index c76915e..62c61fd 100644
+--- a/src/composables/collection/useCollectionSubscribe.ts
++++ b/src/composables/collection/useCollectionSubscribe.ts
+@@ -6,8 +6,7 @@ import { toast } from "@/composables/useToast";
+ /**
+  * 通用收藏 / 取消收藏
+  *
+- * 当前支持：netease playlist / album
+- * 待接入：netease radio
++ * 当前支持：netease playlist / album / radio（播客电台）
+  */
+ export const useCollectionSubscribe = (collection: Ref<Collection | null>) => {
+   const { t } = useI18n();
+@@ -24,6 +23,9 @@ export const useCollectionSubscribe = (collection: Ref<Collection | null>) => {
+     if (current.type === "album") {
+       return userStore.albums.some((item) => item.id === current.id);
+     }
++    if (current.type === "radio") {
++      return userStore.radios.some((item) => item.id === current.id);
++    }
+     return false;
+   });
+ 
+@@ -34,7 +36,7 @@ export const useCollectionSubscribe = (collection: Ref<Collection | null>) => {
+     if (current.type === "playlist") {
+       return !userStore.createdPlaylists.some((item) => item.id === current.id);
+     }
+-    if (current.type === "album") return true;
++    if (current.type === "album" || current.type === "radio") return true;
+     return false;
+   });
+ 
+@@ -49,6 +51,8 @@ export const useCollectionSubscribe = (collection: Ref<Collection | null>) => {
+         await userStore.togglePlaylistSubscribe(current.id, next);
+       } else if (current.type === "album") {
+         await userStore.toggleAlbumSubscribe(current.id, next);
++      } else if (current.type === "radio") {
++        await userStore.toggleRadioSubscribe(current.id, next);
+       }
+     } catch (err) {
+       const message = err instanceof Error && err.message ? err.message : t("liked.toast.failed");
+diff --git a/src/layouts/MainLayout.vue b/src/layouts/MainLayout.vue
+index 5a7fd4c..206a380 100644
+--- a/src/layouts/MainLayout.vue
++++ b/src/layouts/MainLayout.vue
+@@ -39,6 +39,7 @@ const cachedViews = [
+   "Download",
+   "Daily",
+   "Favorites",
++  "Podcast",
+   "Cloud",
+   "LocalList",
+   "Folders",
+diff --git a/src/pages/Collection.vue b/src/pages/Collection.vue
+index 3b96d99..1d2bfef 100644
+--- a/src/pages/Collection.vue
++++ b/src/pages/Collection.vue
+@@ -415,7 +415,7 @@ onBeforeUnmount(() => {
+           ref="songListRef"
+           :items="collection.tracks"
+           :search-query="searchQuery"
+-          :show-album="type !== 'album'"
++          :show-album="type !== 'album' && type !== 'radio'"
+           :show-size="source === 'local'"
+           :source="source"
+           :collection-type="type"
+diff --git a/src/pages/Favorites.vue b/src/pages/Favorites.vue
+index 30cb64f..df05c17 100644
+--- a/src/pages/Favorites.vue
++++ b/src/pages/Favorites.vue
+@@ -8,20 +8,22 @@ import {
+   artistsToCoverItems,
+   playlistToCoverItem,
+ } from "@/utils/format/coverItem";
++import { djRadioToCoverItem } from "@/utils/format/radio";
+ import CoverList from "@/components/list/CoverList.vue";
+ import IconLucideListMusic from "~icons/lucide/list-music";
+ import IconLucideDisc3 from "~icons/lucide/disc-3";
+ import IconLucideUser from "~icons/lucide/user";
+ import IconMaterialSymbolsFavoriteOutline from "~icons/material-symbols/favorite-outline-rounded";
++import IconLucideRadio from "~icons/lucide/radio";
+ 
+ const { t } = useI18n();
+ const route = useRoute();
+ const router = useRouter();
+ const user = useUserStore();
+ 
+-type FavTab = "playlist" | "album" | "artist";
++type FavTab = "playlist" | "album" | "artist" | "radio";
+ 
+-const TAB_KEYS: readonly FavTab[] = ["playlist", "album", "artist"];
++const TAB_KEYS: readonly FavTab[] = ["playlist", "album", "artist", "radio"];
+ 
+ /** 当前 tab */
+ const activeTab = computed<FavTab>(() => {
+@@ -39,6 +41,7 @@ const tabs = computed(() => [
+   { key: "playlist" satisfies FavTab, label: t("favorites.tabs.playlist") },
+   { key: "album" satisfies FavTab, label: t("favorites.tabs.album") },
+   { key: "artist" satisfies FavTab, label: t("favorites.tabs.artist") },
++  { key: "radio" satisfies FavTab, label: t("favorites.tabs.radio") },
+ ]);
+ 
+ const playlistItems = computed<CoverItem[]>(() =>
+@@ -52,9 +55,12 @@ const albumItems = computed<CoverItem[]>(() => albumsToCoverItems(user.albums));
+ 
+ const artistItems = computed<CoverItem[]>(() => artistsToCoverItems(user.artists));
+ 
++const radioItems = computed<CoverItem[]>(() => user.radios.map(djRadioToCoverItem));
++
+ const currentItems = computed<CoverItem[]>(() => {
+   if (activeTab.value === "playlist") return playlistItems.value;
+   if (activeTab.value === "album") return albumItems.value;
++  if (activeTab.value === "radio") return radioItems.value;
+   return artistItems.value;
+ });
+ 
+@@ -70,6 +76,11 @@ const countMeta = computed(() => {
+         icon: IconLucideUser,
+         text: t("common.totalArtists", { count: artistItems.value.length }),
+       };
++    case "radio":
++      return {
++        icon: IconLucideRadio,
++        text: t("common.totalRadios", { count: radioItems.value.length }),
++      };
+     case "playlist":
+     default:
+       return {
+diff --git a/src/pages/Podcast.vue b/src/pages/Podcast.vue
+new file mode 100644
+index 0000000..66935d3
+--- /dev/null
++++ b/src/pages/Podcast.vue
+@@ -0,0 +1,234 @@
++<script setup lang="ts">
++defineOptions({ name: "Podcast" });
++
++import type { Playlist } from "@shared/types/player";
++import type { CoverItem } from "@/types/artist";
++import {
++  fetchRadioCategories,
++  fetchRadioCategoryRecommend,
++  fetchRadioToplist,
++  type RadioCategory,
++} from "@/apis/radio/netease";
++import CoverList from "@/components/list/CoverList.vue";
++import { useUserStore } from "@/stores/user";
++import { useFloatingPlayerBar } from "@/composables/useFloatingPlayerBar";
++import { toast } from "@/composables/useToast";
++import { djRadioToCoverItem } from "@/utils/format/radio";
++
++const { t } = useI18n();
++const router = useRouter();
++const user = useUserStore();
++const { isFloatingBar } = useFloatingPlayerBar();
++
++/** 分类入口 */
++const categories = shallowRef<RadioCategory[]>([]);
++const categoriesLoading = ref(false);
++/** 热门推荐 */
++const hotItems = shallowRef<CoverItem[]>([]);
++const hotLoading = ref(false);
++/** 分类推荐分组 */
++const groups = shallowRef<{ id: number; name: string; items: CoverItem[] }[]>([]);
++const groupsLoading = ref(false);
++
++/** 同一次刷新只提示一次失败，避免接口整体挂掉时 toast 刷屏 */
++let notifiedFailure = false;
++
++const notifyFailure = (): void => {
++  if (notifiedFailure) return;
++  notifiedFailure = true;
++  toast.error(t("podcast.loadFailed"));
++};
++
++/** 电台 → 封面卡片 */
++const toItems = (radios: Playlist[]): CoverItem[] => radios.map(djRadioToCoverItem);
++
++/** 分类入口，失败不影响其它区块 */
++const loadCategories = async (): Promise<void> => {
++  categoriesLoading.value = true;
++  try {
++    categories.value = await fetchRadioCategories();
++  } catch {
++    categories.value = [];
++    notifyFailure();
++  } finally {
++    categoriesLoading.value = false;
++  }
++};
++
++/** 热门电台 */
++const loadHot = async (): Promise<void> => {
++  hotLoading.value = true;
++  try {
++    hotItems.value = toItems(await fetchRadioToplist("hot", 30));
++  } catch {
++    hotItems.value = [];
++    notifyFailure();
++  } finally {
++    hotLoading.value = false;
++  }
++};
++
++/** 分类推荐 */
++const loadCategoryRecommend = async (): Promise<void> => {
++  groupsLoading.value = true;
++  try {
++    const result = await fetchRadioCategoryRecommend();
++    groups.value = result.map((group) => ({
++      id: group.id,
++      name: group.name,
++      items: toItems(group.radios),
++    }));
++  } catch {
++    groups.value = [];
++    notifyFailure();
++  } finally {
++    groupsLoading.value = false;
++  }
++};
++
++/** 重新拉取全部区块 */
++const reload = (): void => {
++  notifiedFailure = false;
++  void loadCategories();
++  void loadHot();
++  void loadCategoryRecommend();
++};
++
++onMounted(reload);
++
++/** 我订阅的电台（登录后由 user store 统一拉取） */
++const subscriptionItems = computed<CoverItem[]>(() => toItems(user.radios));
++
++/** 打开电台详情 */
++const openRadio = (item: CoverItem): void => {
++  router.push(`/collection/netease/radio/${encodeURIComponent(item.id)}`);
++};
++
++/** 打开分类详情 */
++const openCategory = (category: RadioCategory): void => {
++  router.push({
++    name: "podcast-category",
++    params: { id: String(category.id) },
++    query: { name: category.name },
++  });
++};
++</script>
++
++<template>
++  <div class="h-full overflow-y-auto">
++    <div
++      class="mx-auto flex max-w-[1400px] flex-col gap-6 px-6 pt-6"
++      :class="isFloatingBar ? 'pb-28' : 'pb-10'"
++    >
++      <!-- 顶栏 -->
++      <header class="flex items-end justify-between gap-6">
++        <div class="min-w-0">
++          <h1 class="text-3xl font-bold text-on-surface text-balance">{{ t("podcast.title") }}</h1>
++          <p v-if="!user.isLoggedIn" class="mt-2 text-sm text-on-surface-variant/60">
++            {{ t("podcast.notLoggedIn") }}
++          </p>
++        </div>
++        <SButton
++          class="shrink-0"
++          variant="secondary"
++          size="small"
++          :loading="categoriesLoading || hotLoading || groupsLoading"
++          @click="reload"
++        >
++          <template #icon><IconLucideRefreshCw /></template>
++          {{ t("podcast.refresh") }}
++        </SButton>
++      </header>
++      <!-- 分类入口 -->
++      <section class="flex flex-col gap-3">
++        <h3 class="text-lg font-semibold text-on-surface">{{ t("podcast.categories") }}</h3>
++        <div
++          v-if="categoriesLoading"
++          class="flex items-center gap-2 text-sm text-on-surface-variant/50"
++        >
++          <SLoading class="size-3.5 text-primary/70 shrink-0" />
++          <span>{{ t("common.loading") }}</span>
++        </div>
++        <div
++          v-else-if="categories.length > 0"
++          class="grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-6"
++        >
++          <SCard
++            v-for="category in categories"
++            :key="category.id"
++            radius="xl"
++            size="small"
++            hoverable
++            class="flex items-center gap-2"
++            @click="openCategory(category)"
++          >
++            <IconLucideRadio class="size-4 shrink-0 text-primary" />
++            <span class="truncate text-sm text-on-surface">{{ category.name }}</span>
++          </SCard>
++        </div>
++        <div
++          v-else
++          class="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-on-surface/12 py-10 text-on-surface-variant/40"
++        >
++          <IconLucidePodcast class="size-7" />
++          <span class="text-sm">{{ t("podcast.empty") }}</span>
++        </div>
++      </section>
++      <!-- 我的订阅 -->
++      <section v-if="user.isLoggedIn" class="flex flex-col gap-3">
++        <h3 class="text-lg font-semibold text-on-surface">{{ t("podcast.mySubscriptions") }}</h3>
++        <CoverList
++          v-if="subscriptionItems.length > 0"
++          :items="subscriptionItems"
++          :virtual="false"
++          :gap="16"
++          @click="openRadio"
++        />
++        <div
++          v-else
++          class="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-on-surface/12 py-10 text-on-surface-variant/40"
++        >
++          <IconLucidePodcast class="size-7" />
++          <span class="text-sm">{{ t("podcast.emptySubscription") }}</span>
++        </div>
++      </section>
++      <!-- 热门推荐 -->
++      <section class="flex flex-col gap-3">
++        <h3 class="text-lg font-semibold text-on-surface">{{ t("podcast.hot") }}</h3>
++        <div v-if="hotLoading" class="flex items-center gap-2 text-sm text-on-surface-variant/50">
++          <SLoading class="size-3.5 text-primary/70 shrink-0" />
++          <span>{{ t("common.loading") }}</span>
++        </div>
++        <CoverList
++          v-else-if="hotItems.length > 0"
++          :items="hotItems"
++          :virtual="false"
++          :gap="16"
++          @click="openRadio"
++        />
++        <div
++          v-else
++          class="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-on-surface/12 py-10 text-on-surface-variant/40"
++        >
++          <IconLucidePodcast class="size-7" />
++          <span class="text-sm">{{ t("podcast.empty") }}</span>
++        </div>
++      </section>
++      <!-- 分类推荐 -->
++      <section v-if="groupsLoading || groups.length > 0" class="flex flex-col gap-6">
++        <h3 class="text-lg font-semibold text-on-surface">{{ t("podcast.categoryRecommend") }}</h3>
++        <div
++          v-if="groupsLoading"
++          class="flex items-center gap-2 text-sm text-on-surface-variant/50"
++        >
++          <SLoading class="size-3.5 text-primary/70 shrink-0" />
++          <span>{{ t("common.loading") }}</span>
++        </div>
++        <div v-for="group in groups" :key="group.id" class="flex flex-col gap-3">
++          <h4 class="text-sm font-medium text-on-surface-variant/70">{{ group.name }}</h4>
++          <CoverList :items="group.items" :virtual="false" :gap="16" @click="openRadio" />
++        </div>
++      </section>
++    </div>
++  </div>
++</template>
+diff --git a/src/pages/PodcastCategory.vue b/src/pages/PodcastCategory.vue
+new file mode 100644
+index 0000000..c11c629
+--- /dev/null
++++ b/src/pages/PodcastCategory.vue
+@@ -0,0 +1,130 @@
++<script setup lang="ts">
++defineOptions({ name: "PodcastCategory" });
++
++import type { CoverItem } from "@/types/artist";
++import { fetchRadioCategoryHot, fetchRadioRecommendByCategory } from "@/apis/radio/netease";
++import CoverList from "@/components/list/CoverList.vue";
++import { djRadioToCoverItem } from "@/utils/format/radio";
++
++type CategoryTab = "hot" | "recommend";
++
++const { t } = useI18n();
++const route = useRoute();
++const router = useRouter();
++
++/** 分类 id（路由参数） */
++const categoryId = computed(() => Number(route.params.id));
++
++/** 分类名称（列表页通过 query 带过来，缺失时回落到页面标题） */
++const categoryName = computed(() =>
++  typeof route.query.name === "string" && route.query.name ? route.query.name : t("podcast.title"),
++);
++
++const tabs = computed(() => [
++  { key: "hot" satisfies CategoryTab, label: t("podcast.tabs.hot") },
++  { key: "recommend" satisfies CategoryTab, label: t("podcast.tabs.recommend") },
++]);
++
++const activeTab = ref<CategoryTab>("hot");
++
++/** 每个页签各自的列表与加载状态，切换时按需加载并保留结果 */
++const items = reactive<Record<CategoryTab, CoverItem[]>>({ hot: [], recommend: [] });
++const loaded = reactive<Record<CategoryTab, boolean>>({ hot: false, recommend: false });
++const loading = ref(false);
++const error = ref("");
++
++/**
++ * 拉取指定页签
++ * @param tab - 页签 key
++ */
++const load = async (tab: CategoryTab): Promise<void> => {
++  if (loading.value || loaded[tab]) return;
++  loading.value = true;
++  error.value = "";
++  try {
++    const radios =
++      tab === "hot"
++        ? await fetchRadioCategoryHot(categoryId.value)
++        : await fetchRadioRecommendByCategory(categoryId.value);
++    items[tab] = radios.map(djRadioToCoverItem);
++    loaded[tab] = true;
++  } catch (err) {
++    error.value = err instanceof Error ? err.message : String(err);
++  } finally {
++    loading.value = false;
++  }
++};
++
++onMounted(() => void load("hot"));
++
++const onTabSwitch = (key: string): void => {
++  activeTab.value = key as CategoryTab;
++  void load(activeTab.value);
++};
++
++/** 失败后重试当前页签 */
++const onRetry = (): void => {
++  loaded[activeTab.value] = false;
++  error.value = "";
++  void load(activeTab.value);
++};
++
++/** 打开电台详情 */
++const openRadio = (item: CoverItem): void => {
++  router.push(`/collection/netease/radio/${encodeURIComponent(item.id)}`);
++};
++</script>
++
++<template>
++  <div class="flex flex-col h-full">
++    <!-- 顶栏 -->
++    <div class="shrink-0 px-5 pb-2">
++      <div class="flex items-center gap-3 mt-2 mb-4 min-w-0">
++        <SButton variant="ghost" size="small" class="shrink-0" @click="router.push('/podcast')">
++          <template #icon><IconLucideArrowLeft /></template>
++          {{ t("podcast.back") }}
++        </SButton>
++        <h1 class="truncate text-3xl font-bold text-on-surface text-balance">
++          {{ categoryName }}
++        </h1>
++      </div>
++      <STabs :model-value="activeTab" :tabs="tabs" @update:model-value="onTabSwitch" />
++    </div>
++    <!-- 加载中 -->
++    <div v-if="loading" class="flex-1 flex items-center justify-center">
++      <div class="text-center text-on-surface-variant/60">
++        <SLoading class="text-4xl text-primary/70 mb-4 mx-auto block" />
++        <div class="text-sm">{{ t("common.loading") }}</div>
++      </div>
++    </div>
++    <!-- 错误态 -->
++    <div v-else-if="error" class="flex-1 flex items-center justify-center px-6">
++      <div class="text-center text-red-500/85">
++        <IconLucideTriangleAlert class="size-14 mx-auto mb-4 opacity-50" />
++        <div class="text-sm font-medium mb-1">{{ t("podcast.loadFailed") }}</div>
++        <div class="text-xs opacity-80 break-all max-w-xs mb-4">{{ error }}</div>
++        <SButton variant="secondary" size="small" @click="onRetry">
++          <template #icon><IconLucideRefreshCw class="size-3.5" /></template>
++          {{ t("common.retry") }}
++        </SButton>
++      </div>
++    </div>
++    <!-- 列表 -->
++    <div v-else-if="items[activeTab].length > 0" class="flex-1 min-h-0">
++      <CoverList
++        :items="items[activeTab]"
++        :padding-x="20"
++        :padding-top="8"
++        :padding-bottom="20"
++        @click="openRadio"
++      />
++    </div>
++    <!-- 空态 -->
++    <div v-else class="flex-1 flex items-center justify-center">
++      <div class="text-center text-on-surface-variant/50">
++        <IconLucidePodcast class="size-12 mx-auto mb-3 opacity-30" />
++        <div class="text-sm">{{ t("podcast.emptyCategory") }}</div>
++      </div>
++    </div>
++  </div>
++</template>
+diff --git a/src/pages/Search.vue b/src/pages/Search.vue
+index 115bcd7..8bf1c4e 100644
+--- a/src/pages/Search.vue
++++ b/src/pages/Search.vue
+@@ -4,7 +4,13 @@ defineOptions({ name: "SearchPage" });
+ import type { PlaybackContext, Track } from "@shared/types/player";
+ import { ALL_PLATFORMS, PLATFORM_SHORT_NAME, type Platform } from "@shared/types/platform";
+ import type { CoverItem } from "@/types/artist";
+-import { searchSongs, searchAlbums, searchArtists, searchPlaylists } from "@/apis/search";
++import {
++  searchSongs,
++  searchAlbums,
++  searchArtists,
++  searchPlaylists,
++  searchRadios,
++} from "@/apis/search";
+ import SongList from "@/components/list/SongList.vue";
+ import CoverList from "@/components/list/CoverList.vue";
+ import { useStatusStore } from "@/stores/status";
+@@ -15,9 +21,9 @@ const route = useRoute();
+ const router = useRouter();
+ const status = useStatusStore();
+ 
+-type TabKey = "songs" | "albums" | "artists" | "playlists";
++type TabKey = "songs" | "albums" | "artists" | "playlists" | "radios";
+ 
+-const TAB_KEYS: readonly TabKey[] = ["songs", "albums", "artists", "playlists"];
++const TAB_KEYS: readonly TabKey[] = ["songs", "albums", "artists", "playlists", "radios"];
+ 
+ const PAGE_SIZE = 50;
+ 
+@@ -32,6 +38,7 @@ const tabs = computed(() => [
+   { key: "albums", label: t("search.tabs.albums") },
+   { key: "artists", label: t("search.tabs.artists") },
+   { key: "playlists", label: t("search.tabs.playlists") },
++  { key: "radios", label: t("search.tabs.radio") },
+ ]);
+ 
+ const platformTabs = ALL_PLATFORMS.map((key) => ({ key, label: PLATFORM_SHORT_NAME[key] }));
+@@ -59,6 +66,7 @@ const states = reactive({
+   albums: createState<CoverItem>(),
+   artists: createState<CoverItem>(),
+   playlists: createState<CoverItem>(),
++  radios: createState<CoverItem>(),
+ });
+ 
+ const error = ref("");
+@@ -69,6 +77,7 @@ const fetchers = {
+   albums: searchAlbums,
+   artists: searchArtists,
+   playlists: searchPlaylists,
++  radios: searchRadios,
+ } as const;
+ 
+ /**
+@@ -175,6 +184,11 @@ const onReachBottom = (tab: TabKey): void => {
+   fetchTab(tab, true);
+ };
+ 
++/** 打开播客（电台）详情 */
++const openRadio = (item: CoverItem): void => {
++  router.push(`/collection/netease/radio/${encodeURIComponent(item.id)}`);
++};
++
+ /** 当前 tab 首屏加载中 */
+ const isInitialLoading = computed(() => {
+   const state = states[activeTab.value];
+@@ -310,7 +324,7 @@ const playbackContext = computed<PlaybackContext>(() => ({
+         @reach-bottom="onReachBottom('artists')"
+       />
+       <CoverList
+-        v-else
++        v-else-if="activeTab === 'playlists'"
+         :items="states.playlists.items"
+         :padding-x="20"
+         :padding-top="8"
+@@ -322,6 +336,17 @@ const playbackContext = computed<PlaybackContext>(() => ({
+         "
+         @reach-bottom="onReachBottom('playlists')"
+       />
++      <CoverList
++        v-else
++        :items="states.radios.items"
++        :padding-x="20"
++        :padding-top="8"
++        :padding-bottom="20"
++        :has-more="states.radios.hasMore"
++        :loading-more="states.radios.loadingMore"
++        @click="openRadio"
++        @reach-bottom="onReachBottom('radios')"
++      />
+     </div>
+   </div>
+ </template>
+diff --git a/src/router/index.ts b/src/router/index.ts
+index fef5f7f..81df68f 100644
+--- a/src/router/index.ts
++++ b/src/router/index.ts
+@@ -52,6 +52,16 @@ const router = createRouter({
+           name: "favorites",
+           component: () => import("@/pages/Favorites.vue"),
+         },
++        {
++          path: "podcast",
++          name: "podcast",
++          component: () => import("@/pages/Podcast.vue"),
++        },
++        {
++          path: "podcast/category/:id",
++          name: "podcast-category",
++          component: () => import("@/pages/PodcastCategory.vue"),
++        },
+         {
+           path: "cloud",
+           name: "cloud",
+diff --git a/src/services/collection/netease.ts b/src/services/collection/netease.ts
+index 15aed41..b18a9c3 100644
+--- a/src/services/collection/netease.ts
++++ b/src/services/collection/netease.ts
+@@ -2,6 +2,7 @@ import type { Track } from "@shared/types/player";
+ import type { Collection, CollectionType } from "@/types/collection";
+ import { fetchAlbum } from "@/apis/album/netease";
+ import { fetchPlaylist } from "@/apis/playlist/netease";
++import { fetchRadio } from "@/apis/radio/netease";
+ import type { LoadCollectionOptions } from "./types";
+ 
+ export const loadNeteaseCollection = async (
+@@ -29,6 +30,49 @@ export const loadNeteaseCollection = async (
+     );
+     return;
+   }
++  if (type === "radio") {
++    // 电台详情只给元数据，节目按页流式补，大电台也能先出首屏
++    const radioTracks: Track[] = [];
++    let radioMeta: {
++      name: string;
++      cover?: string;
++      description?: string;
++      owner?: string;
++      count?: number;
++    } | null = null;
++    const currentRadio = (): Collection | null =>
++      radioMeta
++        ? {
++            id,
++            type,
++            source: "netease",
++            title: radioMeta.name,
++            cover: radioMeta.cover,
++            description: radioMeta.description,
++            creator: radioMeta.owner,
++            tracks: [...radioTracks],
++            trackCount: radioMeta.count ?? radioTracks.length,
++          }
++        : null;
++    await fetchRadio(decodeURIComponent(id), {
++      signal: options.signal,
++      onMeta: (radio) => {
++        radioMeta = {
++          name: radio.name,
++          cover: radio.cover,
++          description: radio.description,
++          owner: radio.owner,
++          count: radio.trackCount,
++        };
++        if (!options.signal?.aborted) options.onUpdate(currentRadio());
++      },
++      onBatch: (batch) => {
++        radioTracks.push(...batch);
++        if (!options.signal?.aborted) options.onUpdate(currentRadio());
++      },
++    });
++    return;
++  }
+   if (type !== "playlist") {
+     options.onUpdate(null);
+     return;
+diff --git a/src/stores/user.ts b/src/stores/user.ts
+index 576dda8..0b358ba 100644
+--- a/src/stores/user.ts
++++ b/src/stores/user.ts
+@@ -28,6 +28,7 @@ import {
+   subscribePlaylist,
+ } from "@/apis/playlist/netease";
+ import { subscribeAlbum } from "@/apis/album/netease";
++import { fetchUserRadios, subscribeRadio } from "@/apis/radio/netease";
+ import { subscribeArtist } from "@/apis/artist/netease";
+ import { fetchUserCloud, deleteCloudSongs } from "@/apis/cloud/netease";
+ 
+@@ -99,6 +100,8 @@ export const useUserStore = defineStore(
+     const albums = shallowRef<Album[]>([]);
+     /** 收藏歌手 */
+     const artists = shallowRef<Artist[]>([]);
++    /** 订阅的电台（播客） */
++    const radios = shallowRef<Playlist[]>([]);
+     /** 用户等级 */
+     const level = ref<number | undefined>(undefined);
+     /** 订阅计数 */
+@@ -190,6 +193,7 @@ export const useUserStore = defineStore(
+       likedSongIds.value = new Set();
+       albums.value = [];
+       artists.value = [];
++      radios.value = [];
+       level.value = undefined;
+       subcount.value = EMPTY_SUBCOUNT;
+       likedPlaylistAbort?.abort();
+@@ -431,14 +435,16 @@ export const useUserStore = defineStore(
+         fetchUserAlbums(),
+         fetchUserArtists(),
+         fetchUserLevel(),
++        fetchUserRadios(),
+       ]);
+-      const [_plRes, likeRes, albumRes, artistRes, levelRes] = settled;
++      const [_plRes, likeRes, albumRes, artistRes, levelRes, radioRes] = settled;
+       if (likeRes.status === "fulfilled") {
+         applyLikedSongIds(likeRes.value);
+       }
+       if (albumRes.status === "fulfilled") albums.value = albumRes.value;
+       if (artistRes.status === "fulfilled") artists.value = artistRes.value;
+       if (levelRes.status === "fulfilled") level.value = levelRes.value;
++      if (radioRes.status === "fulfilled") radios.value = radioRes.value;
+       for (const result of settled) {
+         if (result.status === "rejected") {
+           console.warn("[user] content load failed:", result.reason);
+@@ -605,6 +611,12 @@ export const useUserStore = defineStore(
+       artists.value = await fetchUserArtists();
+     };
+ 
++    /** 订阅 / 取消订阅电台（播客） */
++    const toggleRadioSubscribe = async (rid: string, subscribe: boolean): Promise<void> => {
++      await subscribeRadio(rid, subscribe);
++      radios.value = await fetchUserRadios();
++    };
++
+     /** 同步用户内容 */
+     const syncContent = (uid: number | undefined): void => {
+       if (uid) void loadContent(uid);
+@@ -683,6 +695,7 @@ export const useUserStore = defineStore(
+       likedSongIds,
+       albums,
+       artists,
++      radios,
+       level,
+       subcount,
+       likedPlaylistId,
+@@ -713,6 +726,7 @@ export const useUserStore = defineStore(
+       togglePlaylistSubscribe,
+       toggleAlbumSubscribe,
+       toggleArtistSubscribe,
++      toggleRadioSubscribe,
+     };
+   },
+   {
+diff --git a/src/utils/format/radio.spec.ts b/src/utils/format/radio.spec.ts
+new file mode 100644
+index 0000000..28530c7
+--- /dev/null
++++ b/src/utils/format/radio.spec.ts
+@@ -0,0 +1,128 @@
++import { describe, expect, it } from "vitest";
++import type { NeteaseDjProgram, NeteaseDjRadio } from "@shared/types/radio";
++import { djRadioToCoverItem, programToTrack, toDjRadio } from "./radio";
++
++/** 一份贴近真实接口的电台详情返回（字段名按 /dj/toplist 与 /dj/detail 实测） */
++const radio: NeteaseDjRadio = {
++  id: 972022490,
++  name: "清音悦耳",
++  picUrl: "https://p4.music.126.net/cover.jpg",
++  desc: "最新最热，一次听完",
++  programCount: 787,
++  subCount: 43356,
++  dj: { userId: 6449043723, nickname: "清尘伊笑" },
++};
++
++/** 一份贴近真实接口的节目返回（mainSong 用经典字段名 artists/album/duration） */
++const program: NeteaseDjProgram = {
++  id: 3081834575,
++  name: "把不想做的事暂时放下",
++  duration: 1114226,
++  coverUrl: "https://p3.music.126.net/episode.jpg",
++  mainTrackId: 2730355242,
++  mainSong: {
++    id: 2730355242,
++    name: "把不想做的事暂时放下",
++    fee: 0,
++    duration: 1114226,
++    artists: [{ id: 0, name: "清尘伊笑" }],
++    album: { id: 0, name: "", picUrl: "https://p3.music.126.net/album.jpg" },
++  },
++  radio,
++};
++
++describe("电台条目映射", () => {
++  it("字段落到 Playlist：节目数当 trackCount、主播当 owner", () => {
++    expect(toDjRadio(radio)).toEqual({
++      id: "972022490",
++      name: "清音悦耳",
++      cover: "https://p4.music.126.net/cover.jpg?param=300y300",
++      description: "最新最热，一次听完",
++      trackCount: 787,
++      owner: "清尘伊笑",
++    });
++  });
++
++  it("详情接口的 interPicUrl 也能当封面", () => {
++    const detail = { ...radio, picUrl: undefined, interPicUrl: "https://p1.music.126.net/i.jpg" };
++    expect(toDjRadio(detail).cover).toBe("https://p1.music.126.net/i.jpg?param=300y300");
++  });
++
++  it("缺主播昵称时回退 creatorName", () => {
++    const raw = { id: 1, name: "无名电台", creatorName: "某人" };
++    expect(toDjRadio(raw).owner).toBe("某人");
++  });
++
++  it("封面卡片带主播副标题", () => {
++    expect(djRadioToCoverItem(toDjRadio(radio))).toMatchObject({
++      id: "972022490",
++      title: "清音悦耳",
++      subtitle: "清尘伊笑",
++      trackCount: 787,
++    });
++  });
++});
++
++describe("节目映射为可播放 Track", () => {
++  it("id 取 mainSong.id、extId 取节目 id、album.id 取电台 id（打卡按这三个判定 dj）", () => {
++    expect(programToTrack(program)).toMatchObject({
++      id: "2730355242",
++      extId: "3081834575",
++      source: "netease",
++      title: "把不想做的事暂时放下",
++      duration: 1114226,
++      artists: [{ id: "0", name: "清尘伊笑" }],
++      album: {
++        id: "972022490",
++        name: "清音悦耳",
++        cover: "https://p4.music.126.net/cover.jpg?param=300y300",
++      },
++      cover: "https://p3.music.126.net/episode.jpg?param=300y300",
++    });
++  });
++
++  it("新命名（ar/al/dt）与经典命名（artists/album/duration）都能映射", () => {
++    const modern: NeteaseDjProgram = {
++      ...program,
++      duration: undefined,
++      mainSong: {
++        id: 42,
++        name: "节目",
++        dt: 60000,
++        ar: [{ id: 7, name: "主播" }],
++        al: { id: 9, name: "专辑名", picUrl: "https://p.music.126.net/a.jpg" },
++      },
++    };
++    expect(programToTrack(modern)).toMatchObject({
++      id: "42",
++      duration: 60000,
++      artists: [{ id: "7", name: "主播" }],
++    });
++  });
++
++  it("节目自带 radio 时无需外部传入也能拿到电台 id", () => {
++    expect(programToTrack(program)?.album?.id).toBe("972022490");
++  });
++
++  it("没有 mainSong.id 时回退 mainTrackId，两者都没有则返回 null", () => {
++    const fallback: NeteaseDjProgram = {
++      id: 5,
++      name: "无主歌曲",
++      mainTrackId: 99,
++      mainSong: undefined,
++      radio,
++    };
++    expect(programToTrack(fallback)?.id).toBe("99");
++    expect(programToTrack({ id: 6, name: "空节目" })).toBeNull();
++  });
++
++  it("mainSong 没有歌手时用电台名兜底", () => {
++    const noArtist: NeteaseDjProgram = {
++      id: 7,
++      name: "节目",
++      mainSong: { id: 100, name: "节目", artists: [], album: undefined },
++      radio,
++    };
++    expect(programToTrack(noArtist)?.artists).toEqual([{ name: "清音悦耳" }]);
++  });
++});
+diff --git a/src/utils/format/radio.ts b/src/utils/format/radio.ts
+new file mode 100644
+index 0000000..d7cfc4b
+--- /dev/null
++++ b/src/utils/format/radio.ts
+@@ -0,0 +1,19 @@
++import type { Playlist } from "@shared/types/player";
++import { djRadioCover, programToTrack, toDjRadio } from "@shared/utils/radio";
++import type { CoverItem } from "@/types/artist";
++
++// 映射与主进程共用（见 shared/utils/radio.ts），这里保持原有导出面
++export { djRadioCover, programToTrack, toDjRadio };
++
++/**
++ * 电台（播客）→ 封面卡片
++ * @param radio - 应用层 Playlist
++ * @returns 展示模型 CoverItem
++ */
++export const djRadioToCoverItem = (radio: Playlist): CoverItem => ({
++  id: radio.id ?? "",
++  title: radio.name,
++  cover: radio.cover,
++  subtitle: radio.owner ?? "",
++  trackCount: radio.trackCount ?? 0,
++});

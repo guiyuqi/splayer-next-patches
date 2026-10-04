@@ -1,0 +1,685 @@
+From 81e0148d2995a0ec8697f11d3490458beb112837 Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:47 +0800
+Subject: [PATCH 1/8] =?UTF-8?q?chore:=20=E8=A1=A5=E9=BD=90=E5=85=B1?=
+ =?UTF-8?q?=E4=BA=AB=E7=B1=BB=E5=9E=8B=E3=80=81=E8=AE=BE=E7=BD=AE=E9=A1=B9?=
+ =?UTF-8?q?=E5=AE=9A=E4=B9=89=E4=B8=8E=E4=B8=AD=E8=8B=B1=E6=96=87=E6=A1=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ shared/defaults/settings.ts              |   1 +
+ shared/types/nowPlaying.ts               |  27 +++++
+ shared/types/player.ts                   |   9 ++
+ shared/types/settings.ts                 |  19 +++-
+ shared/utils/netease.ts                  | 120 +++++++++++++++++++++++
+ src/i18n/locales/en-US.json              |  44 +++++++++
+ src/i18n/locales/zh-CN.json              |  44 +++++++++
+ src/settings/categories/aiIntegration.ts |  11 +++
+ src/settings/categories/lyric.ts         |  15 +++
+ src/settings/categories/player.ts        |   6 ++
+ src/types/settings.ts                    |   8 +-
+ src/utils/format/netease.ts              |  92 +----------------
+ 12 files changed, 307 insertions(+), 89 deletions(-)
+ create mode 100644 shared/utils/netease.ts
+
+diff --git a/shared/defaults/settings.ts b/shared/defaults/settings.ts
+index b9bcfe1..289ad40 100644
+--- a/shared/defaults/settings.ts
++++ b/shared/defaults/settings.ts
+@@ -144,6 +144,7 @@ export const defaultSystemConfig: SystemConfig = {
+   mcp: {
+     enabled: false,
+     port: 14559,
++    bindMode: "loopback",
+     accessKey: "",
+   },
+   update: {
+diff --git a/shared/types/nowPlaying.ts b/shared/types/nowPlaying.ts
+index 2e15447..05173f0 100644
+--- a/shared/types/nowPlaying.ts
++++ b/shared/types/nowPlaying.ts
+@@ -44,10 +44,37 @@ export interface NowPlayingLyricOffsetSync {
+   offsetMs: number;
+ }
+ 
++/** 播放队列窗口半径：推送当前曲目前后各多少首 */
++export const QUEUE_WINDOW_RADIUS = 5;
++
++/** 播放队列窗口里的一首歌（精简字段，供外部客户端读取上下文） */
++export interface NowPlayingQueueTrack {
++  id: string;
++  title: string;
++  /** 艺术家名称列表 */
++  artists: string[];
++  /** 时长（毫秒） */
++  durationMs: number;
++}
++
++/** 渲染进程 → 主进程：同步播放队列窗口 */
++export interface NowPlayingQueueSnapshot {
++  /** 当前播放曲目在队列中的下标；-1 表示未定位 */
++  index: number;
++  /** 队列总长 */
++  total: number;
++  /** tracks[0] 在队列中的绝对下标 */
++  startIndex: number;
++  /** 以当前曲目为中心、最多前后各 QUEUE_WINDOW_RADIUS 首的窗口 */
++  tracks: NowPlayingQueueTrack[];
++}
++
+ /** NowPlaying API */
+ export interface NowPlayingApi {
+   /** 同步当前播放状态到主进程 */
+   update: (payload: NowPlayingUpdatePayload) => void;
++  /** 同步播放队列窗口到主进程 */
++  updateQueue: (payload: NowPlayingQueueSnapshot) => void;
+   /** 拉取当前完整快照 */
+   requestSnapshot: () => Promise<NowPlayingSnapshot>;
+   /** 写入指定曲目的歌词偏移（ms）；0 视为清除 */
+diff --git a/shared/types/player.ts b/shared/types/player.ts
+index 42d8137..d1e3846 100644
+--- a/shared/types/player.ts
++++ b/shared/types/player.ts
+@@ -224,9 +224,18 @@ export type PlayerEvent =
+   | { type: "next" }
+   | { type: "prev" }
+   | { type: "playTrack"; data: { track: Track } }
++  | {
++      type: "playList";
++      data: { tracks: Track[]; index: number; context?: PlaybackContext };
++    }
+   | { type: "setShuffle"; data: { mode: ShuffleMode } }
+   | { type: "setRepeat"; data: { mode: RepeatMode } }
++  | { type: "setVolume"; data: { volume: number } }
+   | { type: "addToQueue"; data: { tracks: Track[]; position: "next" | "end" } }
++  | { type: "removeFromQueue"; data: { index: number } }
++  | { type: "moveInQueue"; data: { from: number; to: number } }
++  | { type: "clearQueue" }
++  | { type: "jumpToIndex"; data: { index: number } }
+   | { type: "toggleLike" }
+   | { type: "fftData"; data: FftData }
+   | { type: "error"; error: string }
+diff --git a/shared/types/settings.ts b/shared/types/settings.ts
+index 745db25..061d1ed 100644
+--- a/shared/types/settings.ts
++++ b/shared/types/settings.ts
+@@ -242,12 +242,21 @@ export interface ExternalApiSettings {
+   port: number;
+ }
+ 
++/** MCP 服务监听范围 */
++export type McpBindMode = "loopback" | "wsl" | "lan";
++
+ /** MCP 服务配置 */
+ export interface McpSettings {
+   /** 服务开关 */
+   enabled: boolean;
+-  /** 仅本机监听的端口 */
++  /** 监听端口 */
+   port: number;
++  /**
++   * 监听范围：
++   * loopback 仅本机；wsl 本机 + WSL/Hyper-V 虚拟网卡（供 WSL 内的 Agent 直连，不对局域网开放）；
++   * lan 监听 0.0.0.0（局域网内任意主机可访问，仅有连接密钥保护）
++   */
++  bindMode: McpBindMode;
+   /** 本机客户端连接密钥，由主进程首次使用时生成 */
+   accessKey: string;
+ }
+@@ -283,6 +292,10 @@ export interface ExternalApiStatus {
+ export interface McpStatus {
+   /** 是否正在监听 */
+   listening: boolean;
++  /** 实际生效的监听范围（与配置项比对判断是否待重启） */
++  bindMode: McpBindMode;
++  /** 展示用主机地址：loopback 为 127.0.0.1，wsl 为 WSL 虚拟网卡地址，lan 为本机局域网 IP */
++  host: string | null;
+   /** 实际监听端口 */
+   port: number | null;
+   /** 上次启动失败的错误 */
+@@ -293,6 +306,8 @@ export interface McpStatus {
+ export interface McpClientConfigParams {
+   /** MCP 服务实际使用或即将使用的端口 */
+   port: number;
++  /** 客户端应连接的地址，开放局域网时为本机局域网 IP */
++  host: string;
+   /** 本机客户端连接密钥 */
+   accessKey: string;
+ }
+@@ -309,6 +324,8 @@ export interface McpAgentApp {
+   configured: boolean;
+   /** 是否支持自动写入配置 */
+   injectable: boolean;
++  /** 注入后需要用户额外处理时的提示（i18n key） */
++  hintKey?: string;
+ }
+ 
+ /** 在线歌词服务配置 */
+diff --git a/shared/utils/netease.ts b/shared/utils/netease.ts
+new file mode 100644
+index 0000000..2505a9d
+--- /dev/null
++++ b/shared/utils/netease.ts
+@@ -0,0 +1,120 @@
++import type { AudioQuality, Track, TrackFee } from "@shared/types/player";
++
++/**
++ * 网易云原始歌曲 → 应用层 Track 的纯映射
++ *
++ * 渲染层与主进程共用：渲染层用它把接口响应转成界面数据，主进程用它把歌单曲目
++ * 转成可入队的 Track。
++ */
++
++/** 单音质规格（仅取映射需要的字段） */
++interface RawQuality {
++  br: number;
++  sr: number;
++}
++
++/** 映射用到的原始歌曲字段；接口同时存在新旧两套命名，且可空 */
++export interface NeteaseRawSong {
++  id: number;
++  name: string;
++  /** 新命名歌手 */
++  ar?: { id: number; name?: string }[] | null;
++  /** 旧命名歌手 */
++  artists?: { id: number; name?: string }[] | null;
++  /** 新命名专辑 */
++  al?: { id: number; name: string; picUrl?: string } | null;
++  /** 旧命名专辑 */
++  album?: { id: number; name: string; picUrl?: string } | null;
++  alias?: string[] | null;
++  alia?: string[] | null;
++  /** 时长（毫秒） */
++  dt?: number | null;
++  duration?: number | null;
++  fee?: TrackFee | null;
++  /** 云盘歌曲标记，非 null 即视为云盘（具体结构不参与映射） */
++  pc?: unknown;
++  h?: RawQuality | null;
++  m?: RawQuality | null;
++  l?: RawQuality | null;
++  sq?: RawQuality | null;
++  hr?: RawQuality | null;
++}
++
++/** 按展示尺寸补齐封面地址 */
++export const withPicSize = (url: string | undefined, size = 300): string | undefined => {
++  if (!url) return undefined;
++  if (url.includes("?param=")) return url;
++  return `${url}?param=${size}y${size}`;
++};
++
++/** 从原始歌曲里挑出最高可用音质 */
++export const pickQuality = (song: NeteaseRawSong): AudioQuality | undefined => {
++  if (song.hr) {
++    return {
++      codec: "flac",
++      sampleRate: Math.max(song.hr.sr ?? 0, 96000),
++      bitsPerSample: 24,
++      bitRate: song.hr.br,
++      channels: 2,
++    };
++  }
++  if (song.sq) {
++    return {
++      codec: "flac",
++      sampleRate: song.sq.sr,
++      bitsPerSample: 16,
++      bitRate: song.sq.br,
++      channels: 2,
++    };
++  }
++  const mp3 = song.h ?? song.m ?? song.l;
++  if (mp3) {
++    return {
++      codec: "mp3",
++      sampleRate: mp3.sr,
++      bitsPerSample: 16,
++      bitRate: mp3.br,
++      channels: 2,
++    };
++  }
++  return undefined;
++};
++
++/**
++ * 网易云歌曲 → 队列用 Track
++ * @param song - 接口返回的原始歌曲
++ * @returns 应用层 Track
++ */
++export const songToTrack = (song: NeteaseRawSong): Track => {
++  // 兼容旧字段
++  const album = song.al ?? song.album;
++  const ar = song.ar ?? song.artists ?? [];
++  const aliasList = song.alia ?? song.alias;
++  const cover = withPicSize(album?.picUrl);
++  const coverOriginal = withPicSize(album?.picUrl, 1024);
++  const comment = aliasList?.find((s) => s?.trim()) ?? undefined;
++  return {
++    id: String(song.id),
++    source: "netease",
++    title: song.name,
++    comment,
++    artists: ar
++      .filter((artist) => artist.name?.trim())
++      .map((artist) => ({ id: String(artist.id), name: artist.name!.trim() })),
++    album: album ? { id: String(album.id), name: album.name, cover } : undefined,
++    duration: song.dt ?? song.duration ?? 0,
++    cover,
++    coverOriginal,
++    quality: pickQuality(song),
++    fee: song.fee ?? undefined,
++    cloud: song.pc != null ? true : undefined,
++  };
++};
++
++/**
++ * 批量转换网易云歌曲
++ * @param songs - 原始歌曲列表
++ * @returns Track 列表
++ */
++export const songsToTracks = (songs: NeteaseRawSong[] | undefined | null): Track[] =>
++  songs?.map(songToTrack) ?? [];
+diff --git a/src/i18n/locales/en-US.json b/src/i18n/locales/en-US.json
+index c136087..466b643 100644
+--- a/src/i18n/locales/en-US.json
++++ b/src/i18n/locales/en-US.json
+@@ -95,6 +95,7 @@
+     "reject": "Decline & Exit"
+   },
+   "common": {
++    "totalRadios": "{count} podcasts",
+     "back": "Back",
+     "confirm": "Confirm",
+     "cancel": "Cancel",
+@@ -195,6 +196,7 @@
+     "reset": "Reset to default"
+   },
+   "nav": {
++    "podcast": "Podcast",
+     "home": "Home",
+     "library": "Library",
+     "liked": "Liked Songs",
+@@ -231,6 +233,24 @@
+       "playlist": "Go to playlist [{id}]"
+     }
+   },
++  "podcast": {
++    "title": "Podcast",
++    "categories": "Categories",
++    "mySubscriptions": "My Subscriptions",
++    "hot": "Trending",
++    "categoryRecommend": "Recommended by Category",
++    "empty": "No podcasts yet",
++    "emptySubscription": "No subscribed podcasts yet",
++    "emptyCategory": "No podcasts in this category yet",
++    "loadFailed": "Failed to load podcasts",
++    "refresh": "Refresh",
++    "notLoggedIn": "Sign in to sync your subscriptions",
++    "back": "Back to Podcast",
++    "tabs": {
++      "hot": "Trending",
++      "recommend": "Recommended"
++    }
++  },
+   "recognition": {
+     "title": "Music Recognition",
+     "entry": "Recognize",
+@@ -399,6 +419,7 @@
+     "noResultsHint": "Try another keyword or switch the source",
+     "errorTitle": "Search failed",
+     "tabs": {
++      "radio": "Podcasts",
+       "songs": "Songs",
+       "albums": "Albums",
+       "artists": "Artists",
+@@ -703,6 +724,7 @@
+     "empty": "Nothing here yet — go explore and save something you like",
+     "notLogin": "Sign in to see your favorites",
+     "tabs": {
++      "radio": "Podcasts",
+       "playlist": "Playlists",
+       "album": "Albums",
+       "artist": "Artists"
+@@ -726,6 +748,25 @@
+     "nestedHint": "Folder is nested with an existing one; skipped"
+   },
+   "settings": {
++    "mcpBindMode": {
++      "lan": "All LAN interfaces (0.0.0.0, key-protected only)",
++      "wsl": "Local + WSL adapter (recommended)",
++      "loopback": "Local only (127.0.0.1)",
++      "description": "Which interfaces the MCP server binds to. \"Local + WSL adapter\" lets Agents inside WSL connect directly without exposing the port to your LAN; restart the server to apply",
++      "label": "Listen scope"
++    },
++    "horizontalOffset": {
++      "description": "Shift the lyrics by a percentage of the lyric area width; negative moves left (towards the cover). Works with centering on or off.",
++      "label": "Lyric horizontal offset"
++    },
++    "alignCenter": {
++      "description": "Center the lyric text horizontally inside the lyric area instead of the default left alignment",
++      "label": "Center lyrics"
++    },
++    "playFromSourceList": {
++      "description": "When enabled, playing a single track from a playlist, album or list loads that whole list into the queue and starts from that track",
++      "label": "Load source list on play"
++    },
+     "title": "Settings",
+     "subtitle": "Tailor your experience",
+     "search": "Search settings...",
+@@ -1889,6 +1930,9 @@
+       "description": "View and copy the MCP configuration required to connect an AI Agent"
+     },
+     "mcp": {
++      "dshHint": "Restart dsh web to apply",
++      "reconfigure": "Reconfigure",
++      "pendingRestart": "Config changed — click Restart server to apply (running: {mode})",
+       "restart": "Restart server",
+       "restarted": "MCP server restarted",
+       "portInUse": "Port {port} is already in use, pick another",
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+index 2e590b0..855ac99 100644
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -83,6 +83,7 @@
+     "reject": "不同意并退出"
+   },
+   "common": {
++    "totalRadios": "{count} 个播客",
+     "back": "返回",
+     "confirm": "确认",
+     "cancel": "取消",
+@@ -183,6 +184,7 @@
+     "reset": "恢复默认"
+   },
+   "nav": {
++    "podcast": "播客",
+     "home": "首页",
+     "library": "音乐库",
+     "liked": "我喜欢的音乐",
+@@ -219,6 +221,24 @@
+       "playlist": "前往歌单「{id}」"
+     }
+   },
++  "podcast": {
++    "title": "播客",
++    "categories": "分类",
++    "mySubscriptions": "我的订阅",
++    "hot": "热门推荐",
++    "categoryRecommend": "分类推荐",
++    "empty": "暂无播客内容",
++    "emptySubscription": "还没有订阅任何播客",
++    "emptyCategory": "该分类下暂无播客",
++    "loadFailed": "加载播客内容失败",
++    "refresh": "刷新",
++    "notLoggedIn": "登录后可同步「我的订阅」",
++    "back": "返回播客",
++    "tabs": {
++      "hot": "热门",
++      "recommend": "推荐"
++    }
++  },
+   "recognition": {
+     "title": "听歌识曲",
+     "entry": "听歌识曲",
+@@ -387,6 +407,7 @@
+     "noResultsHint": "换个关键词或切换音源试试",
+     "errorTitle": "搜索失败",
+     "tabs": {
++      "radio": "播客",
+       "songs": "单曲",
+       "albums": "专辑",
+       "artists": "歌手",
+@@ -691,6 +712,7 @@
+     "empty": "这里还空空如也，去发现一些喜欢的内容吧",
+     "notLogin": "登录后才能查看收藏的内容",
+     "tabs": {
++      "radio": "播客",
+       "playlist": "歌单",
+       "album": "专辑",
+       "artist": "歌手"
+@@ -714,6 +736,25 @@
+     "nestedHint": "该目录与已添加目录嵌套，已自动跳过"
+   },
+   "settings": {
++    "mcpBindMode": {
++      "lan": "局域网全部网卡（0.0.0.0，仅有密钥保护）",
++      "wsl": "本机 + WSL 虚拟网卡（推荐）",
++      "loopback": "仅本机（127.0.0.1）",
++      "description": "控制 MCP 服务绑定的网卡：推荐「本机 + WSL 虚拟网卡」，WSL 里的 Agent 可直连而端口不对局域网开放；改动需重启服务生效",
++      "label": "监听范围"
++    },
++    "horizontalOffset": {
++      "description": "相对歌词区域宽度的百分比平移歌词，负值向左（靠近封面），不受是否居中影响",
++      "label": "歌词水平偏移"
++    },
++    "alignCenter": {
++      "description": "歌词文本在歌词区域内水平居中，而非默认靠左",
++      "label": "歌词居中显示"
++    },
++    "playFromSourceList": {
++      "description": "开启后，在歌单 / 专辑 / 列表中点播单曲会把整张列表载入播放队列，并从该曲开始播放",
++      "label": "点单曲时载入所在列表"
++    },
+     "title": "设置",
+     "subtitle": "调整您的专属配置",
+     "search": "搜索设置项...",
+@@ -1877,6 +1918,9 @@
+       "description": "查看并复制 AI Agent 连接所需的 MCP 配置"
+     },
+     "mcp": {
++      "dshHint": "写入后需重启 dsh web 才生效",
++      "reconfigure": "重新配置",
++      "pendingRestart": "配置已修改，点「重启服务」生效（当前：{mode}）",
+       "restart": "重启服务",
+       "restarted": "MCP 服务已重启",
+       "portInUse": "端口 {port} 已被占用，请换一个",
+diff --git a/src/settings/categories/aiIntegration.ts b/src/settings/categories/aiIntegration.ts
+index 54fcbbb..b80b463 100644
+--- a/src/settings/categories/aiIntegration.ts
++++ b/src/settings/categories/aiIntegration.ts
+@@ -47,6 +47,17 @@ const aiIntegrationCategory: SettingCategory = {
+               max: 65535,
+               defaultValue: 14559,
+             },
++            {
++              key: "mcpBindMode",
++              type: "select",
++              binding: { store: "settings", path: "system.mcp.bindMode" },
++              options: [
++                { value: "loopback", labelKey: "settings.mcpBindMode.loopback" },
++                { value: "wsl", labelKey: "settings.mcpBindMode.wsl" },
++                { value: "lan", labelKey: "settings.mcpBindMode.lan" },
++              ],
++              defaultValue: "loopback",
++            },
+             {
+               key: "mcpConfigDetails",
+               type: "custom",
+diff --git a/src/settings/categories/lyric.ts b/src/settings/categories/lyric.ts
+index 1b98655..f12906b 100644
+--- a/src/settings/categories/lyric.ts
++++ b/src/settings/categories/lyric.ts
+@@ -460,6 +460,21 @@ const lyricCategory: SettingCategory = {
+           defaultValue: 0.35,
+           marks: { 0.1: "0.1", 0.35: "0.35", 0.9: "0.9" },
+         },
++        {
++          key: "alignCenter",
++          type: "switch",
++          binding: { store: "settings", path: "lyric.alignCenter" },
++          defaultValue: false,
++        },
++        {
++          key: "horizontalOffset",
++          type: "slider",
++          binding: { store: "settings", path: "lyric.horizontalOffset" },
++          min: -50,
++          max: 50,
++          step: 1,
++          defaultValue: 0,
++        },
+         {
+           key: "wordFadeWidth",
+           type: "slider",
+diff --git a/src/settings/categories/player.ts b/src/settings/categories/player.ts
+index 30ab8d9..f3fc8d2 100644
+--- a/src/settings/categories/player.ts
++++ b/src/settings/categories/player.ts
+@@ -36,6 +36,12 @@ const playerCategory: SettingCategory = {
+           ],
+           defaultValue: "current",
+         },
++        {
++          key: "playFromSourceList",
++          type: "switch",
++          binding: { store: "settings", path: "player.playFromSourceList" },
++          defaultValue: true,
++        },
+         {
+           key: "fadeEnabled",
+           type: "switch",
+diff --git a/src/types/settings.ts b/src/types/settings.ts
+index cc66c86..3c3b8eb 100644
+--- a/src/types/settings.ts
++++ b/src/types/settings.ts
+@@ -109,7 +109,7 @@ export const DEFAULT_SIDEBAR_NAV_GROUPS: SidebarNavGroup[] = [
+   {
+     name: "",
+     showName: false,
+-    keys: ["/liked", "/favorites", "/cloud", "/download", "/streaming", "/history"],
++    keys: ["/liked", "/favorites", "/podcast", "/cloud", "/download", "/streaming", "/history"],
+   },
+ ];
+ 
+@@ -179,6 +179,10 @@ export interface LyricSettings {
+   springStiffness: number;
+   /** 激活行对齐位置（0~1） */
+   alignPosition: number;
++  /** 歌词文本水平居中 */
++  alignCenter: boolean;
++  /** 歌词水平偏移（相对歌词区域宽度的百分比，负值向左） */
++  horizontalOffset: number;
+   /** 逐字掩码渐变宽度 */
+   wordFadeWidth: number;
+   /** 非激活行透明度 */
+@@ -273,6 +277,8 @@ export interface PlayerSettings {
+   transitionPreference: TransitionPreference;
+   /** 搜索页播放行为 */
+   searchPlayBehavior: SearchPlayBehavior;
++  /** 播放单曲时把所在列表整体载入播放队列 */
++  playFromSourceList: boolean;
+ }
+ 
+ /** 外观设置 */
+diff --git a/src/utils/format/netease.ts b/src/utils/format/netease.ts
+index 35da2bb..5e2aadf 100644
+--- a/src/utils/format/netease.ts
++++ b/src/utils/format/netease.ts
+@@ -1,6 +1,9 @@
+-import type { Album, Artist, AudioQuality, Playlist, Track } from "@shared/types/player";
++import type { Album, Artist, Playlist } from "@shared/types/player";
++import { pickQuality, songToTrack, songsToTracks, withPicSize } from "@shared/utils/netease";
+ import type { UserSubcount } from "@/types/user";
+-import type { NeteaseSong } from "@/types/netease";
++
++// 歌曲映射与主进程共用（见 shared/utils/netease.ts），这里保持原有导出面
++export { pickQuality, songToTrack, songsToTracks, withPicSize };
+ 
+ interface NeteaseError {
+   code?: number;
+@@ -20,91 +23,6 @@ export const ensureOk = <T>(body: T): T => {
+   return body;
+ };
+ 
+-/**
+- * 给封面 URL 拼尺寸
+- * @param url - 封面原始 URL
+- * @param size - 期望像素边长，默认 300
+- */
+-export const withPicSize = (url: string | undefined, size = 300): string | undefined => {
+-  if (!url) return undefined;
+-  if (url.includes("?param=")) return url;
+-  return `${url}?param=${size}y${size}`;
+-};
+-
+-/**
+- * 根据 song 对象选择最佳音质
+- * @param song - 原始 song 对象
+- * @returns 最佳音质
+- */
+-const pickQuality = (song: NeteaseSong): AudioQuality | undefined => {
+-  if (song.hr) {
+-    return {
+-      codec: "flac",
+-      sampleRate: Math.max(song.hr.sr ?? 0, 96000),
+-      bitsPerSample: 24,
+-      bitRate: song.hr.br,
+-      channels: 2,
+-    };
+-  }
+-  if (song.sq) {
+-    return {
+-      codec: "flac",
+-      sampleRate: song.sq.sr,
+-      bitsPerSample: 16,
+-      bitRate: song.sq.br,
+-      channels: 2,
+-    };
+-  }
+-  const mp3 = song.h ?? song.m ?? song.l;
+-  if (mp3) {
+-    return {
+-      codec: "mp3",
+-      sampleRate: mp3.sr,
+-      bitsPerSample: 16,
+-      bitRate: mp3.br,
+-      channels: 2,
+-    };
+-  }
+-  return undefined;
+-};
+-
+-/**
+- *  song → 应用层 Track
+- * @param song - 原始 song 对象
+- */
+-export const songToTrack = (song: NeteaseSong): Track => {
+-  // 兼容旧字段
+-  const album = song.al ?? song.album;
+-  const ar = song.ar ?? song.artists ?? [];
+-  const aliasList = song.alia ?? song.alias;
+-  const cover = withPicSize(album?.picUrl);
+-  const coverOriginal = withPicSize(album?.picUrl, 1024);
+-  const comment = aliasList?.find((s) => s?.trim()) ?? undefined;
+-  return {
+-    id: String(song.id),
+-    source: "netease",
+-    title: song.name,
+-    comment,
+-    artists: ar
+-      .filter((artist) => artist.name?.trim())
+-      .map((artist) => ({ id: String(artist.id), name: artist.name.trim() })),
+-    album: album ? { id: String(album.id), name: album.name, cover } : undefined,
+-    duration: song.dt ?? song.duration ?? 0,
+-    cover,
+-    coverOriginal,
+-    quality: pickQuality(song),
+-    fee: song.fee,
+-    cloud: song.pc != null ? true : undefined,
+-  };
+-};
+-
+-/**
+- *  songs 列表 → Track 列表，空/缺省安全
+- * @param songs - 接口返回的 songs 数组
+- */
+-export const songsToTracks = (songs: NeteaseSong[] | undefined | null): Track[] =>
+-  songs?.map(songToTrack) ?? [];
+-
+ /**
+  * 歌单条目 → 应用层 Playlist
+  * 适用 `/user/playlist` 与 `/playlist/detail` 的 playlist 字段

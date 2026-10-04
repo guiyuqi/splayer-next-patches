@@ -1,0 +1,3201 @@
+From 8ef4e3dd8a6ce3b0b2f1ea18d49f1378828934ad Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:48 +0800
+Subject: [PATCH 6/8] =?UTF-8?q?feat:=20=E5=86=85=E7=BD=AE=20MCP=20?=
+ =?UTF-8?q?=E6=8E=A7=E5=88=B6=E9=9D=A2=EF=BC=88=E5=B7=A5=E5=85=B7=E9=9D=A2?=
+ =?UTF-8?q?=20+=20=E4=B8=80=E9=94=AE=E9=85=8D=E7=BD=AE=20+=20=E4=BC=9A?=
+ =?UTF-8?q?=E8=AF=9D=E9=80=8F=E6=98=8E=E9=87=8D=E5=BB=BA=EF=BC=89?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ electron/main/database/playlists.ts           |  40 +
+ electron/main/ipc/nowPlaying.ts               |   7 +-
+ electron/main/server/index.ts                 |  21 +-
+ electron/main/services/mcp/dshConfig.spec.ts  |  97 +++
+ electron/main/services/mcp/dshConfig.ts       | 209 +++++
+ electron/main/services/mcp/endpoint.ts        |  99 ++-
+ electron/main/services/mcp/http.ts            | 155 ++--
+ electron/main/services/mcp/injector.ts        | 124 +--
+ electron/main/services/mcp/likes.ts           |  52 ++
+ electron/main/services/mcp/playlists.spec.ts  | 200 +++++
+ electron/main/services/mcp/playlists.ts       | 548 ++++++++++++
+ electron/main/services/mcp/podcasts.ts        | 150 ++++
+ electron/main/services/mcp/server.ts          | 779 ++++++++++++++++++
+ electron/main/services/nowPlaying.ts          |  14 +
+ electron/main/store/migrations.ts             |  18 +-
+ electron/main/utils/lan.spec.ts               |  49 ++
+ electron/main/utils/lan.ts                    |  43 +
+ electron/preload/index.ts                     |   2 +
+ .../settings/custom/McpConfigDialog.vue       |  12 +-
+ .../settings/custom/McpStatusCard.vue         |  25 +-
+ src/main.ts                                   |   3 +
+ src/services/queueSync.ts                     |  49 ++
+ 22 files changed, 2549 insertions(+), 147 deletions(-)
+ create mode 100644 electron/main/services/mcp/dshConfig.spec.ts
+ create mode 100644 electron/main/services/mcp/dshConfig.ts
+ create mode 100644 electron/main/services/mcp/likes.ts
+ create mode 100644 electron/main/services/mcp/playlists.spec.ts
+ create mode 100644 electron/main/services/mcp/playlists.ts
+ create mode 100644 electron/main/services/mcp/podcasts.ts
+ create mode 100644 electron/main/utils/lan.spec.ts
+ create mode 100644 electron/main/utils/lan.ts
+ create mode 100644 src/services/queueSync.ts
+
+diff --git a/electron/main/database/playlists.ts b/electron/main/database/playlists.ts
+index 1354535..8217267 100644
+--- a/electron/main/database/playlists.ts
++++ b/electron/main/database/playlists.ts
+@@ -227,6 +227,46 @@ export const removePlaylistTracks = (id: string, trackIds: string[]): number =>
+   })();
+ };
+ 
++/**
++ * 读取本机歌单的曲目 id 顺序
++ * @param id - 歌单 ID
++ * @returns 按位置排序的曲目 id
++ */
++export const getPlaylistTrackIds = (id: string): string[] =>
++  (
++    getDb()
++      .prepare("SELECT track_id FROM playlist_tracks WHERE playlist_id = ? ORDER BY position")
++      .all(id) as { track_id: string }[]
++  ).map((row) => row.track_id);
++
++/**
++ * 重排本机歌单曲序
++ *
++ * 本机歌单在同一条 SQLite 事务里改 position，天然原子，也不会变动"加入时间"。
++ * 顺序数组必须与当前曲目集合完全一致，避免误删或漏项。
++ * @param id - 歌单 ID
++ * @param orderedTrackIds - 期望的完整顺序
++ * @returns 是否写入成功
++ */
++export const reorderPlaylistTracks = (id: string, orderedTrackIds: string[]): boolean => {
++  const playlist = getPlaylists().find((item) => item.id === id);
++  if (!playlist || playlist.type !== "local") return false;
++  const next = [...new Set(orderedTrackIds)];
++  const database = getDb();
++  return database.transaction(() => {
++    const current = getPlaylistTrackIds(id);
++    if (next.length !== current.length) return false;
++    const currentSet = new Set(current);
++    if (!next.every((trackId) => currentSet.has(trackId))) return false;
++    const update = database.prepare(
++      "UPDATE playlist_tracks SET position = ? WHERE playlist_id = ? AND track_id = ?",
++    );
++    next.forEach((trackId, position) => update.run(position, id, trackId));
++    database.prepare("UPDATE playlists SET updated_at = ? WHERE id = ?").run(Date.now(), id);
++    return true;
++  })();
++};
++
+ /**
+  * 导入旧版 renderer 本地歌单
+  * @param records - IndexedDB 歌单记录
+diff --git a/electron/main/ipc/nowPlaying.ts b/electron/main/ipc/nowPlaying.ts
+index 467372c..38511e8 100644
+--- a/electron/main/ipc/nowPlaying.ts
++++ b/electron/main/ipc/nowPlaying.ts
+@@ -2,7 +2,7 @@ import { ipcMain } from "electron";
+ import { broadcast } from "@main/utils/broadcast";
+ import { wsBroadcast } from "@main/server/broadcast";
+ import * as nowPlaying from "@main/services/nowPlaying";
+-import type { NowPlayingUpdatePayload } from "@shared/types/nowPlaying";
++import type { NowPlayingQueueSnapshot, NowPlayingUpdatePayload } from "@shared/types/nowPlaying";
+ 
+ export const registerNowPlayingIpc = (): void => {
+   // 渲染进程同步当前播放状态到主进程
+@@ -10,6 +10,11 @@ export const registerNowPlayingIpc = (): void => {
+     nowPlaying.update(payload.track, payload.lyric, payload.source);
+   });
+ 
++  // 渲染进程同步播放队列窗口（供 MCP / 外部客户端读取播放上下文）
++  ipcMain.on("nowPlaying:updateQueue", (_event, payload: NowPlayingQueueSnapshot) => {
++    nowPlaying.updateQueue(payload);
++  });
++
+   // 渲染进程写入指定曲目的歌词偏移
+   ipcMain.on("nowPlaying:setLyricOffset", (_event, trackId: string, offsetMs: number) => {
+     nowPlaying.setLyricOffset(trackId, offsetMs);
+diff --git a/electron/main/server/index.ts b/electron/main/server/index.ts
+index 08e47ac..0a7f871 100644
+--- a/electron/main/server/index.ts
++++ b/electron/main/server/index.ts
+@@ -3,13 +3,13 @@
+  */
+ 
+ import type { Server } from "node:http";
+-import os from "node:os";
+ import { Hono } from "hono";
+ import { serve, upgradeWebSocket } from "@hono/node-server";
+ import { WebSocketServer } from "ws";
+ import { store } from "@main/store";
+ import { serverLog } from "@main/utils/logger";
+ import { broadcast } from "@main/utils/broadcast";
++import { getLanAddress } from "@main/utils/lan";
+ import type { ExternalApiStatus } from "@shared/types/settings";
+ import { externalControlGate, wsGate } from "./gate";
+ import { buildRoutes } from "./routes";
+@@ -22,25 +22,6 @@ let runningHost: string | null = null;
+ let runningAllowLan = false;
+ let lastError: { code: string; message: string } | null = null;
+ 
+-/**
+- * 取局域网展示地址，绑定 0.0.0.0 时作为展示给用户的局域网入口
+- * 优先常见家用/企业网段：WSL2/Hyper-V 的虚拟交换机常占用 172.x 且排在物理网卡前
+- */
+-const getLanAddress = (): string | null => {
+-  const candidates: string[] = [];
+-  for (const list of Object.values(os.networkInterfaces())) {
+-    for (const item of list ?? []) {
+-      if (item.family === "IPv4" && !item.internal) candidates.push(item.address);
+-    }
+-  }
+-  return (
+-    candidates.find((address) => address.startsWith("192.168.")) ??
+-    candidates.find((address) => address.startsWith("10.")) ??
+-    candidates[0] ??
+-    null
+-  );
+-};
+-
+ export const getServerStatus = (): ExternalApiStatus => ({
+   listening: runningServer !== null,
+   allowLan: runningAllowLan,
+diff --git a/electron/main/services/mcp/dshConfig.spec.ts b/electron/main/services/mcp/dshConfig.spec.ts
+new file mode 100644
+index 0000000..3e33871
+--- /dev/null
++++ b/electron/main/services/mcp/dshConfig.spec.ts
+@@ -0,0 +1,97 @@
++import { describe, expect, it, vi } from "vitest";
++import {
++  buildDshBlock,
++  buildPatchContent,
++  DSH_BLOCK_END,
++  DSH_BLOCK_START,
++  isDshManaged,
++  parseWslDistroList,
++} from "./dshConfig";
++
++// logger 会把 electron 依赖链拉进测试环境，这里隔离掉
++vi.mock("@main/utils/logger", () => ({
++  nativeLog: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
++}));
++
++const params = {
++  host: "192.168.192.1",
++  port: 14559,
++  accessKey: "test-key",
++};
++
++const block = buildDshBlock(params);
++
++describe("DSH patch 内容生成", () => {
++  it("只有自动生成块才算「已配置」，手写条目不算", () => {
++    const handWritten = ["- insert:", "    - id: mcp-splayer", "      name: x"].join("\n");
++
++    expect(isDshManaged(handWritten)).toBe(false);
++    expect(isDshManaged(buildPatchContent(handWritten, block))).toBe(true);
++  });
++
++  it("解析 wsl.exe 的 UTF-16LE 发行版列表（含空行与 NUL）", () => {
++    const raw = Buffer.from("Ubuntu\r\n\r\ndocker-desktop\0\r\n", "utf16le");
++
++    expect(parseWslDistroList(raw)).toEqual(["Ubuntu", "docker-desktop"]);
++    expect(parseWslDistroList("Ubuntu\n")).toEqual(["Ubuntu"]);
++  });
++
++  it("生成带标记的 streamable-http 条目", () => {
++    expect(block.startsWith(DSH_BLOCK_START)).toBe(true);
++    expect(block.endsWith(DSH_BLOCK_END)).toBe(true);
++    expect(block).toContain("url: http://192.168.192.1:14559/mcp");
++    expect(block).toContain("X-MCP-Key: test-key");
++    expect(block).toContain("transport: streamable-http");
++  });
++
++  it("空文件直接追加并补换行", () => {
++    expect(buildPatchContent("", block)).toBe(`${block}\n`);
++  });
++
++  it("已有其它条目时追加到末尾，保留原有内容", () => {
++    const original = "# 说明\n- insert:\n    - id: other\n      name: x\n";
++    const next = buildPatchContent(original, block);
++
++    expect(next).toContain("- id: other");
++    expect(next.trimEnd().endsWith(DSH_BLOCK_END)).toBe(true);
++    expect(next).toContain(DSH_BLOCK_START);
++  });
++
++  it("替换手写的 mcp-splayer 条目，且不吞掉后续注释", () => {
++    const original = [
++      "# 头部说明",
++      "- insert:",
++      "    - id: mcp-splayer",
++      "      name: '@deepseek-ai/dsh-mcp-client'",
++      "      config:",
++      "        transport: stdio",
++      "",
++      "# 尾部说明：不要动我",
++    ].join("\n");
++    const next = buildPatchContent(original, block);
++
++    expect(next).toContain("# 头部说明");
++    expect(next).toContain("# 尾部说明：不要动我");
++    expect(next).toContain("transport: streamable-http");
++    expect(next).not.toContain("transport: stdio");
++    expect(next.match(/mcp-splayer/g)).toHaveLength(1);
++  });
++
++  it("重复注入保持单块（幂等）", () => {
++    const once = buildPatchContent("# 说明\n- insert:\n    - id: other\n      name: x\n", block);
++    const twice = buildPatchContent(once, block);
++
++    expect(twice).toBe(once);
++    expect(
++      twice.match(new RegExp(DSH_BLOCK_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")),
++    ).toHaveLength(1);
++  });
++
++  it("无法定位顶层 insert 时退回追加，不动原文件", () => {
++    const original = "config:\n  id: mcp-splayer\n";
++    const next = buildPatchContent(original, block);
++
++    expect(next).toContain("config:\n  id: mcp-splayer");
++    expect(next).toContain(DSH_BLOCK_START);
++  });
++});
+diff --git a/electron/main/services/mcp/dshConfig.ts b/electron/main/services/mcp/dshConfig.ts
+new file mode 100644
+index 0000000..a2870aa
+--- /dev/null
++++ b/electron/main/services/mcp/dshConfig.ts
+@@ -0,0 +1,209 @@
++/**
++ * DSH（DeepSeek Harness）MCP 配置注入
++ *
++ * DSH 运行在 WSL 内，配置不是 mcpServers JSON，而是 profile 的 loader patch YAML
++ * （`~/.dsh/profiles/<profile>/cordis.patch.yml`）。本模块负责定位该文件、生成
++ * streamable-http 条目，并做「标记块 / 手写条目」两种形态的原地替换。
++ */
++
++import { execFile } from "node:child_process";
++import fs from "node:fs/promises";
++import path from "node:path";
++import { promisify } from "node:util";
++import { nativeLog } from "@main/utils/logger";
++import type { McpClientConfigParams } from "@shared/types/settings";
++
++const run = promisify(execFile);
++
++/** WSL 发行版根目录候选（新版别名优先） */
++const WSL_ROOTS = ["\\\\wsl.localhost\\", "\\\\wsl$\\"];
++/** 自动生成块的首标记 */
++export const DSH_BLOCK_START = "# >>> splayer-next mcp (auto-generated)";
++/** 自动生成块的尾标记 */
++export const DSH_BLOCK_END = "# <<< splayer-next mcp";
++
++/** 解析到的 DSH 配置目标 */
++export interface DshTarget {
++  /** WSL 发行版名 */
++  distro: string;
++  /** profile patch 文件路径（Windows UNC 形式） */
++  patchPath: string;
++}
++
++/**
++ * 解析 `wsl.exe -l -q` 的输出
++ *
++ * wsl.exe 输出为 UTF-16LE，且带空行与结尾 NUL；按是否含 NUL 判断编码后清洗。
++ * @param output - 命令原始输出
++ * @returns 发行版名列表
++ */
++export const parseWslDistroList = (output: Buffer | string): string[] => {
++  const buffer = typeof output === "string" ? Buffer.from(output, "utf-8") : output;
++  const text = buffer.includes(0) ? buffer.toString("utf16le") : buffer.toString("utf-8");
++  return text
++    .split(/\r?\n/)
++    .map((line) => line.replace(/\0/g, "").trim())
++    .filter(Boolean);
++};
++
++/**
++ * 列出发行版
++ *
++ * `\\wsl.localhost\` 这类 UNC 根目录无法被枚举（系统 API 只接受 \\server\share），
++ * 因此优先走 wsl.exe；没有 wsl.exe（非 Windows）或调用失败时退回目录枚举。
++ * @returns 发行版名列表
++ */
++const listWslDistros = async (): Promise<string[]> => {
++  try {
++    const { stdout } = await run("wsl.exe", ["-l", "-q"], {
++      windowsHide: true,
++      timeout: 2500,
++      encoding: "buffer",
++    });
++    const distros = parseWslDistroList(stdout as unknown as Buffer);
++    if (distros.length > 0) return distros;
++  } catch {
++    // 非 Windows 或 wsl.exe 不可用时走下面的目录枚举
++  }
++  for (const root of WSL_ROOTS) {
++    const distros = await fs.readdir(root).catch(() => [] as string[]);
++    if (distros.length > 0) return distros;
++  }
++  return [];
++};
++
++/** 探测结果缓存时长：检测流程会连续问两次路径，且 WSL 读取较慢 */
++const TARGET_CACHE_MS = 30_000;
++
++/** 缓存的目标与写入时刻 */
++let cachedTarget: { value: DshTarget | null; at: number } | null = null;
++
++/**
++ * 定位 WSL 内的 DSH profile patch 文件
++ *
++ * 结果缓存 30 秒：一次弹窗检测会分别调用 getConfigPath 与 getInstallPaths，
++ * 每次都跑 wsl.exe + UNC 扫描会让界面明显发涩；注入时强制重新探测。
++ * @param refresh - 是否忽略缓存
++ * @returns 目标信息；未找到时返回 null
++ */
++export const findDshTarget = async (refresh = false): Promise<DshTarget | null> => {
++  if (!refresh && cachedTarget && Date.now() - cachedTarget.at < TARGET_CACHE_MS) {
++    return cachedTarget.value;
++  }
++  const distros = await listWslDistros();
++  for (const distro of distros) {
++    for (const root of WSL_ROOTS) {
++      const homes = await fs.readdir(path.join(root, distro, "home")).catch(() => [] as string[]);
++      for (const user of homes) {
++        const profilesDir = path.join(root, distro, "home", user, ".dsh", "profiles");
++        const profiles = await fs.readdir(profilesDir).catch(() => [] as string[]);
++        if (profiles.length === 0) continue;
++        // Web 端是默认 profile；否则取第一个真正含 patch 文件的 profile
++        const withPatch: string[] = [];
++        for (const name of profiles) {
++          const exists = await fs.stat(path.join(profilesDir, name, "cordis.patch.yml")).then(
++            () => true,
++            () => false,
++          );
++          if (exists) withPatch.push(name);
++        }
++        const profile = profiles.includes("web")
++          ? "web"
++          : (withPatch[0] ?? profiles.find((name) => name !== "node_modules") ?? profiles[0]);
++        const target = { distro, patchPath: path.join(profilesDir, profile, "cordis.patch.yml") };
++        cachedTarget = { value: target, at: Date.now() };
++        return target;
++      }
++    }
++  }
++  cachedTarget = { value: null, at: Date.now() };
++  return null;
++};
++
++/**
++ * 判断 patch 内容是否已由本应用托管
++ *
++ * 只认自动生成块：手写条目（用户或早期版本手工加的）不算，否则界面会把它显示成
++ * 「已配置」并禁用按钮，导致换密钥/换监听范围后无法重新注入。
++ * @param content - patch 文件内容
++ * @returns 是否含自动生成块
++ */
++export const isDshManaged = (content: string): boolean => content.includes(DSH_BLOCK_START);
++
++/**
++ * 生成 DSH 的 MCP 条目块
++ * @param params - 连接参数（host 必须是 WSL/局域网可达地址）
++ * @returns 带标记的 YAML 片段
++ */
++export const buildDshBlock = (params: McpClientConfigParams): string =>
++  [
++    DSH_BLOCK_START,
++    "- insert:",
++    "    - id: mcp-splayer",
++    "      name: '@deepseek-ai/dsh-mcp-client'",
++    "      config:",
++    "        serverName: splayer",
++    "        transport: streamable-http",
++    `        url: http://${params.host}:${params.port}/mcp`,
++    "        headers:",
++    `          X-MCP-Key: ${params.accessKey}`,
++  ].join("\n") +
++  "\n" +
++  DSH_BLOCK_END;
++
++/**
++ * 把条目块写进 patch 文件内容
++ *
++ * 依次尝试：替换已有的自动生成块 → 替换手写的 mcp-splayer 条目（按缩进边界取块）→ 追加到末尾
++ * @param original - 原文件内容
++ * @param block - 生成的条目块
++ * @returns 新的文件内容
++ */
++export const buildPatchContent = (original: string, block: string): string => {
++  const lines = original.split("\n");
++
++  const start = lines.findIndex((line) => line.trim() === DSH_BLOCK_START);
++  const end = lines.findIndex((line) => line.trim() === DSH_BLOCK_END);
++  if (start >= 0 && end > start) {
++    return [...lines.slice(0, start), block, ...lines.slice(end + 1)].join("\n");
++  }
++
++  const idIndex = lines.findIndex((line) => /^\s*-?\s*id:\s*mcp-splayer\s*$/.test(line));
++  if (idIndex >= 0) {
++    // 向上找到承载它的顶层 `- insert:` 行；找不到就不动原文件，退回追加
++    let from = idIndex;
++    while (from >= 0 && !/^-\s/.test(lines[from])) from--;
++    if (from >= 0) {
++      // 向下吃掉该条目的所有缩进行
++      let to = idIndex;
++      while (to + 1 < lines.length && /^\s+\S/.test(lines[to + 1])) to++;
++      return [...lines.slice(0, from), block, ...lines.slice(to + 1)].join("\n");
++    }
++  }
++
++  const trimmed = original.replace(/\s+$/, "");
++  return `${trimmed ? `${trimmed}\n\n` : ""}${block}\n`;
++};
++
++/**
++ * 把 SPlayer 的 MCP 配置注入 DSH
++ * @param params - 连接参数，host 需为 WSL 可达地址（loopback 会被拒绝）
++ */
++export const injectDshConfig = async (params: McpClientConfigParams): Promise<void> => {
++  if (params.host === "127.0.0.1" || params.host === "localhost") {
++    throw new Error(
++      "DSH 运行在 WSL 里，访问不到 Windows 回环地址：请先把「监听范围」改成「本机 + WSL 虚拟网卡」并点「重启服务」",
++    );
++  }
++  // 注入前强制重新探测：用户可能刚装好 WSL 或新建了 profile
++  const target = await findDshTarget(true);
++  if (!target) {
++    throw new Error("未在 WSL 中找到 DSH 配置目录（~/.dsh/profiles）");
++  }
++
++  const original = await fs.readFile(target.patchPath, "utf-8").catch(() => "");
++  const next = buildPatchContent(original, buildDshBlock(params));
++  await fs.mkdir(path.dirname(target.patchPath), { recursive: true });
++  await fs.writeFile(target.patchPath, next, "utf-8");
++  nativeLog.info(`已写入 DSH MCP 配置：${target.patchPath}（发行版 ${target.distro}）`);
++};
+diff --git a/electron/main/services/mcp/endpoint.ts b/electron/main/services/mcp/endpoint.ts
+index 18f2985..339d569 100644
+--- a/electron/main/services/mcp/endpoint.ts
++++ b/electron/main/services/mcp/endpoint.ts
+@@ -1,7 +1,11 @@
+ import { randomUUID } from "node:crypto";
+ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
++import {
++  DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
++  isInitializeRequest,
++} from "@modelcontextprotocol/sdk/types.js";
++import { serverLog } from "@main/utils/logger";
+ 
+ export interface McpEndpoint {
+   handle(request: Request): Promise<Response>;
+@@ -16,10 +20,20 @@ interface McpSession {
+ 
+ const MAX_SESSIONS = 8;
+ const SESSION_IDLE_MS = 30 * 60 * 1000;
++/** 透明重建会话时使用的合成 initialize 请求 id，仅在本进程内构造，不会回给客户端 */
++const RECOVERY_INIT_ID = "__splayer_session_recovery__";
+ 
+ const errorResponse = (status: number, code: number, message: string): Response =>
+   Response.json({ jsonrpc: "2.0", error: { code, message }, id: null }, { status });
+ 
++/** 是否为需要应答的 JSON-RPC 请求（通知与 initialize 不走会话重建） */
++const isRecoverableRequest = (body: unknown): boolean =>
++  typeof body === "object" &&
++  body !== null &&
++  "id" in body &&
++  "method" in body &&
++  (body as { method: string }).method !== "initialize";
++
+ /**
+  * 创建有界的 MCP HTTP 端点
+  * 会话设有数量与空闲时间上限，避免外部客户端异常退出后长期占用内存。
+@@ -57,23 +71,32 @@ export const createMcpEndpoint = (createServer: () => McpServer): McpEndpoint =>
+       const sessionId = request.headers.get("mcp-session-id");
+       if (sessionId) {
+         const session = sessions.get(sessionId);
+-        if (!session) return errorResponse(404, -32001, "Session not found");
+-        session.lastUsedAt = Date.now();
+-        const response = await session.transport.handleRequest(request);
+-        if (request.method === "DELETE") await closeSession(sessionId);
+-        return response;
++        if (session) {
++          session.lastUsedAt = Date.now();
++          const response = await session.transport.handleRequest(request);
++          if (request.method === "DELETE") await closeSession(sessionId);
++          return response;
++        }
+       }
+ 
+       if (request.method !== "POST") {
+-        return errorResponse(400, -32000, "Mcp-Session-Id header required");
++        return sessionId
++          ? errorResponse(404, -32001, "Session not found")
++          : errorResponse(400, -32000, "Mcp-Session-Id header required");
+       }
+ 
+       const body = await request
+         .clone()
+         .json()
+         .catch(() => null);
+-      if (!isInitializeRequest(body)) {
+-        return errorResponse(400, -32000, "Initialization request required");
++      // 带着失效会话 id 的请求：外部客户端（agent 等）在播放器重启后仍持有旧 id，
++      // 而官方 SDK 客户端不会自行重新 initialize，工具会一直失败到人工重启 agent。
++      // 这里透明重建一个会话服务该请求，并把新 id 放进响应头 —— SDK 客户端会采纳它。
++      const recovering = Boolean(sessionId);
++      if (recovering ? !isRecoverableRequest(body) : !isInitializeRequest(body)) {
++        return recovering
++          ? errorResponse(404, -32001, "Session not found")
++          : errorResponse(400, -32000, "Initialization request required");
+       }
+ 
+       await evictOldest();
+@@ -88,9 +111,61 @@ export const createMcpEndpoint = (createServer: () => McpServer): McpEndpoint =>
+         },
+       });
+       await server.connect(transport);
+-      const response = await transport.handleRequest(request, { parsedBody: body });
+-      if (!initializedId) await server.close();
+-      return response;
++
++      let target = request;
++      if (recovering) {
++        // transport 会以 400 拒绝未初始化状态下的请求，且要求请求头里的会话 id 与自身一致，
++        // 所以先合成一次 initialize，再用新 id 转发原请求。
++        // Accept 必须同时声明两种类型，否则 transport 直接以 406 拒绝这次 initialize。
++        const hello = new Request(request.url, {
++          method: "POST",
++          headers: {
++            "content-type": "application/json",
++            accept: "application/json, text/event-stream",
++          },
++          body: JSON.stringify({
++            jsonrpc: "2.0",
++            id: RECOVERY_INIT_ID,
++            method: "initialize",
++            params: {
++              protocolVersion:
++                request.headers.get("mcp-protocol-version") ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
++              capabilities: {},
++              clientInfo: { name: "splayer-session-recovery", version: "1.0.0" },
++            },
++          }),
++        });
++        const helloResponse = await transport.handleRequest(hello);
++        await helloResponse.body?.cancel();
++        if (!initializedId) {
++          serverLog.warn(`MCP 客户端会话重建失败（HTTP ${helloResponse.status}）`);
++          await server.close();
++          return errorResponse(404, -32001, "Session not found");
++        }
++        const headers = new Headers(request.headers);
++        headers.set("mcp-session-id", initializedId);
++        target = new Request(request.url, {
++          method: "POST",
++          headers,
++          body: JSON.stringify(body),
++        });
++      }
++
++      const response = await transport.handleRequest(target, { parsedBody: body });
++      if (!initializedId) {
++        await server.close();
++        return response;
++      }
++      if (!recovering) return response;
++
++      serverLog.info(`MCP 客户端会话已失效，已透明重建：${initializedId}`);
++      const headers = new Headers(response.headers);
++      headers.set("Mcp-Session-Id", initializedId);
++      return new Response(response.body, {
++        status: response.status,
++        statusText: response.statusText,
++        headers,
++      });
+     },
+     async close(): Promise<void> {
+       await Promise.all([...sessions.keys()].map(closeSession));
+diff --git a/electron/main/services/mcp/http.ts b/electron/main/services/mcp/http.ts
+index 8ba8d84..1b32ed1 100644
+--- a/electron/main/services/mcp/http.ts
++++ b/electron/main/services/mcp/http.ts
+@@ -4,17 +4,22 @@ import { Hono } from "hono";
+ import { serve } from "@hono/node-server";
+ import { store } from "@main/store";
+ import { broadcast } from "@main/utils/broadcast";
++import { getLanAddress, getWslAddresses } from "@main/utils/lan";
+ import { serverLog } from "@main/utils/logger";
+-import type { McpClientConfigParams, McpStatus } from "@shared/types/settings";
++import type { McpBindMode, McpClientConfigParams, McpStatus } from "@shared/types/settings";
+ import { createMcpEndpoint, type McpEndpoint } from "./server";
+ 
+-let runningServer: Server | null = null;
++let runningServers: Server[] = [];
+ let runningEndpoint: McpEndpoint | null = null;
+ let runningPort: number | null = null;
++let runningHost: string | null = null;
++let runningBindMode: McpBindMode = "loopback";
+ let lastError: { code: string; message: string } | null = null;
+ 
+ export const getMcpStatus = (): McpStatus => ({
+-  listening: runningServer !== null,
++  listening: runningServers.length > 0,
++  bindMode: runningBindMode,
++  host: runningHost,
+   port: runningPort,
+   error: lastError,
+ });
+@@ -31,9 +36,24 @@ const getAccessKey = (): string => {
+   return generated;
+ };
+ 
++/** 按监听范围解析要绑定的地址；wsl 模式额外绑定 WSL 虚拟网卡，端口只对 WSL 侧可达 */
++const resolveBindHosts = (mode: McpBindMode): string[] => {
++  if (mode === "lan") return ["0.0.0.0"];
++  if (mode === "wsl") return ["127.0.0.1", ...getWslAddresses()];
++  return ["127.0.0.1"];
++};
++
++/** 展示给用户与客户端的入口地址 */
++const resolveDisplayHost = (mode: McpBindMode): string => {
++  if (mode === "lan") return getLanAddress() ?? "0.0.0.0";
++  if (mode === "wsl") return getWslAddresses()[0] ?? "127.0.0.1";
++  return "127.0.0.1";
++};
++
+ /** 获取生成 AI 客户端配置所需的动态参数 */
+ export const getMcpClientConfigParams = (): McpClientConfigParams => ({
+   port: runningPort ?? store.get("mcp.port"),
++  host: runningHost ?? resolveDisplayHost(store.get("mcp.bindMode")),
+   accessKey: getAccessKey(),
+ });
+ 
+@@ -56,74 +76,103 @@ const isAllowedOrigin = (origin: string | undefined): boolean => {
+   }
+ };
+ 
+-/** 启动仅监听本机的 MCP 服务 */
+-export const startMcpServer = (): Promise<McpStatus> => {
+-  return new Promise((resolve) => {
+-    if (runningServer || !store.get("mcp.enabled")) {
+-      resolve(getMcpStatus());
+-      return;
+-    }
+-
+-    const port = store.get("mcp.port");
+-    const endpoint = createMcpEndpoint();
+-    const app = new Hono();
+-    app.all("/mcp", async (c) => {
+-      if (!store.get("mcp.enabled")) return c.json({ error: "MCP disabled" }, 403);
+-      if (!hasValidAccessKey(c.req.header("x-mcp-key"))) {
+-        return c.json({ error: "invalid MCP key" }, 401);
+-      }
+-      if (!isAllowedOrigin(c.req.header("origin"))) {
+-        return c.json({ error: "invalid Origin" }, 403);
+-      }
+-      return endpoint.handle(c.req.raw);
+-    });
+-    app.get("/", (c) => c.text("SPlayer Next MCP server"));
+-
++/** 绑定单个地址并等待结果；监听成功返回 server，失败返回错误 */
++const listenOn = (
++  app: Hono,
++  host: string,
++  port: number,
++): Promise<{ server: Server } | { error: NodeJS.ErrnoException }> =>
++  new Promise((resolve) => {
+     let settled = false;
+-    const server = serve({ fetch: app.fetch, port, hostname: "127.0.0.1" }) as Server;
++    const server = serve({ fetch: app.fetch, port, hostname: host }) as Server;
+     server.once("error", (error: NodeJS.ErrnoException) => {
+       if (settled) return;
+       settled = true;
+-      lastError = { code: error.code ?? "UNKNOWN", message: error.message };
+-      publishStatus();
+-      serverLog.error(`MCP 服务监听 ${port} 失败 (${lastError.code}): ${lastError.message}`);
+-      void endpoint.close();
+-      try {
+-        server.close();
+-      } catch {}
+-      resolve(getMcpStatus());
++      resolve({ error });
+     });
+     server.once("listening", () => {
+       if (settled) return;
+       settled = true;
+-      runningServer = server;
+-      runningEndpoint = endpoint;
+-      runningPort = port;
+-      lastError = null;
+-      publishStatus();
+-      serverLog.info(`MCP 服务已启动: http://127.0.0.1:${port}/mcp`);
+-      resolve(getMcpStatus());
++      resolve({ server });
+     });
+   });
++
++/** 启动 MCP 服务 */
++export const startMcpServer = async (): Promise<McpStatus> => {
++  if (runningServers.length > 0 || !store.get("mcp.enabled")) return getMcpStatus();
++
++  const port = store.get("mcp.port");
++  const mode = store.get("mcp.bindMode");
++  const hosts = resolveBindHosts(mode);
++  const endpoint = createMcpEndpoint();
++  const app = new Hono();
++  app.all("/mcp", async (c) => {
++    if (!store.get("mcp.enabled")) return c.json({ error: "MCP disabled" }, 403);
++    if (!hasValidAccessKey(c.req.header("x-mcp-key"))) {
++      return c.json({ error: "invalid MCP key" }, 401);
++    }
++    if (!isAllowedOrigin(c.req.header("origin"))) {
++      return c.json({ error: "invalid Origin" }, 403);
++    }
++    return endpoint.handle(c.req.raw);
++  });
++  app.get("/", (c) => c.text("SPlayer Next MCP server"));
++
++  const servers: Server[] = [];
++  for (const host of hosts) {
++    const result = await listenOn(app, host, port);
++    if ("server" in result) {
++      servers.push(result.server);
++      continue;
++    }
++    // 主地址（本机）失败即整体失败；附加地址（WSL 虚拟网卡）失败只告警
++    if (servers.length === 0) {
++      lastError = { code: result.error.code ?? "UNKNOWN", message: result.error.message };
++      serverLog.error(`MCP 服务监听 ${port} 失败 (${lastError.code}): ${lastError.message}`);
++      await endpoint.close();
++      publishStatus();
++      return getMcpStatus();
++    }
++    serverLog.warn(`MCP 服务跳过地址 ${host}（${result.error.code ?? "UNKNOWN"}）`);
++  }
++
++  runningServers = servers;
++  runningEndpoint = endpoint;
++  runningPort = port;
++  runningBindMode = mode;
++  runningHost = resolveDisplayHost(mode);
++  lastError = null;
++  publishStatus();
++  serverLog.info(`MCP 服务已启动: http://${runningHost}:${port}/mcp（绑定 ${hosts.join(", ")}）`);
++  if (mode === "wsl" && hosts.length === 1) {
++    serverLog.warn("未找到 WSL/Hyper-V 虚拟网卡，MCP 服务当前仅本机可达");
++  }
++  if (mode === "lan") serverLog.warn("MCP 服务已开放局域网访问，请勿泄露连接密钥");
++  return getMcpStatus();
+ };
+ 
+ /** 停止 MCP 服务并释放全部会话 */
+ export const stopMcpServer = async (): Promise<void> => {
+-  if (!runningServer) return;
+-  const server = runningServer;
++  if (runningServers.length === 0) return;
++  const servers = runningServers;
+   const endpoint = runningEndpoint;
+-  runningServer = null;
++  runningServers = [];
+   runningEndpoint = null;
+   runningPort = null;
++  runningHost = null;
++  runningBindMode = "loopback";
+   publishStatus();
+-  const serverClosed = new Promise<void>((resolve) => {
+-    server.close((error) => {
+-      if (error) serverLog.warn("MCP 服务关闭异常:", error);
+-      else serverLog.info("MCP 服务已关闭");
+-      resolve();
+-    });
+-  });
+-  await Promise.all([serverClosed, endpoint?.close()]);
++  const closings = servers.map(
++    (server) =>
++      new Promise<void>((resolve) => {
++        server.close((error) => {
++          if (error) serverLog.warn("MCP 服务关闭异常:", error);
++          resolve();
++        });
++      }),
++  );
++  await Promise.all([...closings, endpoint?.close()]);
++  serverLog.info("MCP 服务已关闭");
+ };
+ 
+ /** 配置变更后重启 MCP 服务 */
+diff --git a/electron/main/services/mcp/injector.ts b/electron/main/services/mcp/injector.ts
+index 623a680..7d57b99 100644
+--- a/electron/main/services/mcp/injector.ts
++++ b/electron/main/services/mcp/injector.ts
+@@ -5,14 +5,17 @@ import { app } from "electron";
+ import type { McpAgentApp, McpClientConfigParams } from "@shared/types/settings";
+ import { nativeLog } from "@main/utils/logger";
+ import { isLinux, isMac, isWin } from "@main/utils/config";
++import { findDshTarget, injectDshConfig, isDshManaged } from "./dshConfig";
+ 
+ interface AgentDefinition {
+   id: string;
+   name: string;
+-  getConfigPath: () => string;
+-  getInstallPaths: () => string[];
+-  format?: "json" | "toml" | "antigravity";
++  getConfigPath: () => string | Promise<string>;
++  getInstallPaths: () => string[] | Promise<string[]>;
++  format?: "json" | "toml" | "antigravity" | "dsh";
+   injectable?: boolean;
++  /** 配置完成后需要用户额外处理时的提示 i18n key */
++  hintKey?: string;
+ }
+ 
+ const getAppDataPath = () => app.getPath("appData");
+@@ -107,52 +110,71 @@ const SUPPORTED_AGENTS: AgentDefinition[] = [
+     },
+     format: "antigravity",
+   },
++  {
++    id: "dsh",
++    name: "DeepSeek Harness (WSL)",
++    // DSH 跑在 WSL 内，配置是 profile 的 loader patch YAML，路径需要先探测
++    getConfigPath: async () => (await findDshTarget())?.patchPath ?? "",
++    getInstallPaths: async () => {
++      const target = await findDshTarget();
++      return target ? [path.dirname(path.dirname(target.patchPath))] : [];
++    },
++    format: "dsh",
++    hintKey: "settings.mcp.dshHint",
++  },
+ ];
+ 
+ /**
+- * 探测本地已安装的 AI Agent 及配置状态
++ * 探测单个 Agent 的安装与配置状态
++ * @param agent - Agent 定义
++ * @returns 探测结果；未安装时返回 null
+  */
+-export const detectMcpAgents = async (): Promise<McpAgentApp[]> => {
+-  const detected: McpAgentApp[] = [];
+-
+-  for (const agent of SUPPORTED_AGENTS) {
+-    const configPath = agent.getConfigPath();
+-    const installed = await Promise.any(
+-      [configPath, ...agent.getInstallPaths()].map((candidate) => fs.stat(candidate)),
+-    ).then(
+-      () => true,
+-      () => false,
+-    );
+-
+-    if (!installed) continue;
++const detectAgent = async (agent: AgentDefinition): Promise<McpAgentApp | null> => {
++  const configPath = await agent.getConfigPath();
++  const candidates = [configPath, ...(await agent.getInstallPaths())].filter(Boolean);
++  const installed = await Promise.any(candidates.map((candidate) => fs.stat(candidate))).then(
++    () => true,
++    () => false,
++  );
++  if (!installed) return null;
+ 
+-    let configured = false;
+-    try {
+-      const stats = await fs.stat(configPath);
+-      if (stats.isFile()) {
+-        const content = await fs.readFile(configPath, "utf-8");
+-        configured =
+-          agent.format === "toml"
+-            ? /^\s*\[mcp_servers\.splayer-next\]\s*$/m.test(content)
++  let configured = false;
++  try {
++    const stats = await fs.stat(configPath);
++    if (stats.isFile()) {
++      const content = await fs.readFile(configPath, "utf-8");
++      configured =
++        agent.format === "toml"
++          ? /^\s*\[mcp_servers\.splayer-next\]\s*$/m.test(content)
++          : agent.format === "dsh"
++            ? isDshManaged(content)
+             : !!JSON.parse(content || "{}")?.mcpServers?.["splayer-next"];
+-      }
+-    } catch (error) {
+-      const e = error as NodeJS.ErrnoException;
+-      if (e.code !== "ENOENT") {
+-        nativeLog.warn(`Failed to read config for ${agent.name} at ${configPath}: ${e.message}`);
+-      }
+     }
+-
+-    detected.push({
+-      id: agent.id,
+-      name: agent.name,
+-      configPath,
+-      configured,
+-      injectable: agent.injectable !== false,
+-    });
++  } catch (error) {
++    const e = error as NodeJS.ErrnoException;
++    if (e.code !== "ENOENT") {
++      nativeLog.warn(`Failed to read config for ${agent.name} at ${configPath}: ${e.message}`);
++    }
+   }
+ 
+-  return detected;
++  return {
++    id: agent.id,
++    name: agent.name,
++    configPath,
++    configured,
++    injectable: agent.injectable !== false,
++    ...(agent.hintKey ? { hintKey: agent.hintKey } : {}),
++  };
++};
++
++/**
++ * 探测本地已安装的 AI Agent 及配置状态
++ *
++ * 各 Agent 并行探测：WSL / UNC 路径的读取较慢，串行会让弹窗开得明显发涩。
++ */
++export const detectMcpAgents = async (): Promise<McpAgentApp[]> => {
++  const results = await Promise.all(SUPPORTED_AGENTS.map((agent) => detectAgent(agent)));
++  return results.filter((item): item is McpAgentApp => item !== null);
+ };
+ 
+ /**
+@@ -170,7 +192,13 @@ export const injectMcpAgentConfig = async (
+     throw new Error(`Automatic configuration is not supported for ${agent.name}`);
+   }
+ 
+-  const configPath = agent.getConfigPath();
++  if (agent.format === "dsh") {
++    // DSH 的配置文件在 WSL 内，写入逻辑独立在 dshConfig 中
++    await injectDshConfig(params);
++    return true;
++  }
++
++  const configPath = await agent.getConfigPath();
+ 
+   if (agent.format === "toml") {
+     let content = "";
+@@ -181,14 +209,16 @@ export const injectMcpAgentConfig = async (
+       if (e.code !== "ENOENT") throw error;
+     }
+ 
+-    if (/^\s*\[mcp_servers\.splayer-next\]\s*$/m.test(content)) return true;
+-
+     const section = [
+       "[mcp_servers.splayer-next]",
+-      `url = "http://127.0.0.1:${params.port}/mcp"`,
++      `url = "http://${params.host}:${params.port}/mcp"`,
+       `http_headers = { "X-MCP-Key" = ${JSON.stringify(params.accessKey)} }`,
+     ].join("\n");
+-    const nextContent = `${content.trimEnd()}${content.trim() ? "\n\n" : ""}${section}\n`;
++    // 已存在该段时原位替换，保证换地址/密钥后能重新写入（否则只能靠手工改）
++    const sectionRe = /^\[mcp_servers\.splayer-next\][\s\S]*?(?=\n\[|$)/m;
++    const nextContent = sectionRe.test(content)
++      ? content.replace(sectionRe, section)
++      : `${content.trimEnd()}${content.trim() ? "\n\n" : ""}${section}\n`;
+ 
+     await fs.mkdir(path.dirname(configPath), { recursive: true });
+     await fs.writeFile(configPath, nextContent, "utf-8");
+@@ -216,12 +246,12 @@ export const injectMcpAgentConfig = async (
+   json.mcpServers["splayer-next"] =
+     agent.format === "antigravity"
+       ? {
+-          serverUrl: `http://127.0.0.1:${params.port}/mcp`,
++          serverUrl: `http://${params.host}:${params.port}/mcp`,
+           headers: { "X-MCP-Key": params.accessKey },
+         }
+       : {
+           type: "http",
+-          url: `http://127.0.0.1:${params.port}/mcp`,
++          url: `http://${params.host}:${params.port}/mcp`,
+           headers: { "X-MCP-Key": params.accessKey },
+         };
+ 
+diff --git a/electron/main/services/mcp/likes.ts b/electron/main/services/mcp/likes.ts
+new file mode 100644
+index 0000000..f24a612
+--- /dev/null
++++ b/electron/main/services/mcp/likes.ts
+@@ -0,0 +1,52 @@
++import { callNetease } from "@main/apis/netease";
++import { songToTrack, type NeteaseRawSong } from "@shared/utils/netease";
++import type { Track } from "@shared/types/player";
++import { cacheTracks } from "./cache";
++import { getNeteaseUserId } from "./playlists";
++
++/** song_detail 单批曲目上限 */
++const SONG_DETAIL_BATCH = 500;
++
++export interface LikedTracksResult {
++  total: number;
++  offset: number;
++  limit: number;
++  /** 本页的网易云歌曲 id（全量列表的切片） */
++  ids: string[];
++  tracks: Track[];
++}
++
++/**
++ * 读取「喜欢的音乐」曲目
++ *
++ * 先取全量 id（likelist 只回 id），再按需分页补歌名/歌手，避免一次拉全量。
++ * @param offset - 起始下标（从 0 开始）
++ * @param limit - 本页数量
++ * @returns 曲目总数与本页曲目
++ */
++export const listLikedTracks = async (
++  offset: number,
++  limit: number,
++): Promise<LikedTracksResult> => {
++  const uid = await getNeteaseUserId();
++  if (uid === null) throw new Error("网易云账号未登录，无法读取「喜欢的音乐」");
++  const { body } = await callNetease("likelist", { uid });
++  const allIds = ((body?.ids ?? []) as (number | string)[]).map(String);
++  const ids = allIds.slice(offset, offset + limit);
++
++  const byId = new Map<string, Track>();
++  for (let i = 0; i < ids.length; i += SONG_DETAIL_BATCH) {
++    const chunk = ids.slice(i, i + SONG_DETAIL_BATCH);
++    const { body: detail } = await callNetease("song_detail", { ids: chunk.join(",") });
++    for (const song of (detail?.songs ?? []) as NeteaseRawSong[]) {
++      byId.set(String(song.id), songToTrack(song));
++    }
++  }
++
++  const tracks = ids.flatMap((id) => {
++    const track = byId.get(id);
++    return track ? [track] : [];
++  });
++  cacheTracks(tracks);
++  return { total: allIds.length, offset, limit, ids, tracks };
++};
+diff --git a/electron/main/services/mcp/playlists.spec.ts b/electron/main/services/mcp/playlists.spec.ts
+new file mode 100644
+index 0000000..d7bfe5e
+--- /dev/null
++++ b/electron/main/services/mcp/playlists.spec.ts
+@@ -0,0 +1,200 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { McpPlaylistEntry } from "./playlists";
++
++const mocks = vi.hoisted(() => ({
++  callNetease: vi.fn(),
++  localAddTracks: vi.fn(),
++  localCreatePlaylist: vi.fn(),
++  localDeletePlaylist: vi.fn(),
++  getPlaylist: vi.fn(),
++  localGetTrackIds: vi.fn(),
++  getPlaylists: vi.fn(),
++  localRemoveTracks: vi.fn(),
++  localReorderTracks: vi.fn(),
++  localUpdatePlaylist: vi.fn(),
++}));
++
++vi.mock("@main/apis/netease", () => ({ callNetease: mocks.callNetease }));
++vi.mock("@main/database/playlists", () => ({
++  addPlaylistTracks: mocks.localAddTracks,
++  createPlaylist: mocks.localCreatePlaylist,
++  deletePlaylist: mocks.localDeletePlaylist,
++  getPlaylist: mocks.getPlaylist,
++  getPlaylistTrackIds: mocks.localGetTrackIds,
++  getPlaylists: mocks.getPlaylists,
++  removePlaylistTracks: mocks.localRemoveTracks,
++  reorderPlaylistTracks: mocks.localReorderTracks,
++  updatePlaylist: mocks.localUpdatePlaylist,
++}));
++
++const {
++  addPlaylistTracks,
++  isSameTrackOrder,
++  movePlaylistTrack,
++  normalizeRawTrackIds,
++  reorderPlaylistTracks,
++} = await import("./playlists");
++
++const neteaseEntry: McpPlaylistEntry = {
++  id: "123",
++  name: "测试歌单",
++  trackCount: 3,
++  source: "netease",
++  owned: true,
++};
++
++const localEntry: McpPlaylistEntry = {
++  id: "pl_1",
++  name: "本机歌单",
++  trackCount: 3,
++  source: "local",
++  owned: true,
++};
++
++/** 让 playlist_detail 依次返回给定顺序，模拟写后校验 */
++const stubNeteaseOrders = (orders: string[][]): void => {
++  let index = 0;
++  mocks.callNetease.mockImplementation(async (name: string) => {
++    if (name !== "playlist_detail") return { body: { code: 200 } };
++    const order = orders[Math.min(index++, orders.length - 1)];
++    return { body: { playlist: { trackIds: order.map((id) => ({ id })) } } };
++  });
++};
++
++const playlistTracksCalls = () =>
++  mocks.callNetease.mock.calls.filter(([name]) => name === "playlist_tracks");
++
++beforeEach(() => {
++  vi.clearAllMocks();
++});
++
++describe("trackIds 归一化", () => {
++  it("支持数字、字符串化对象与缺失值", () => {
++    expect(normalizeRawTrackIds([1, { id: 2, at: 1700000000000 }, { id: 3 }])).toEqual([
++      { id: "1" },
++      { id: "2", addTimeMs: 1700000000000 },
++      { id: "3" },
++    ]);
++    expect(normalizeRawTrackIds(undefined)).toEqual([]);
++  });
++});
++
++describe("顺序一致性判断", () => {
++  it("数量、内容或顺序不同都算不一致", () => {
++    expect(isSameTrackOrder(["a", "b"], ["a", "b"])).toBe(true);
++    expect(isSameTrackOrder(["a", "b"], ["b", "a"])).toBe(false);
++    expect(isSameTrackOrder(["a"], ["a", "b"])).toBe(false);
++    expect(isSameTrackOrder([], [])).toBe(true);
++  });
++});
++
++describe("网易云新增曲目", () => {
++  it("逆序提交，保证歌单最终顺序与传入顺序一致", async () => {
++    stubNeteaseOrders([[], ["a", "b"]]);
++
++    const result = await addPlaylistTracks(neteaseEntry, ["a", "b"]);
++
++    expect(playlistTracksCalls()[0][1]).toEqual({ op: "add", pid: "123", tracks: "b,a" });
++    expect(result.beforeOrder).toEqual([]);
++    expect(result.afterOrder).toEqual(["a", "b"]);
++    expect(result.affected).toBe(2);
++    expect(result.note).toContain("插到歌单开头");
++  });
++});
++
++describe("网易云重排曲序", () => {
++  it("校验失败直接报错，不动歌单", async () => {
++    stubNeteaseOrders([["a", "b", "c"]]);
++
++    await expect(reorderPlaylistTracks(neteaseEntry, ["a", "b"])).rejects.toThrow(
++      "顺序数组必须与当前曲目集合一致",
++    );
++    await expect(reorderPlaylistTracks(neteaseEntry, ["a", "b", "x"])).rejects.toThrow(
++      "顺序数组包含不属于该歌单的 id",
++    );
++    expect(playlistTracksCalls()).toHaveLength(0);
++  });
++
++  it("顺序未变化时不做任何写操作", async () => {
++    stubNeteaseOrders([["a", "b", "c"]]);
++
++    const result = await reorderPlaylistTracks(neteaseEntry, ["a", "b", "c"]);
++
++    expect(result.affected).toBe(0);
++    expect(playlistTracksCalls()).toHaveLength(0);
++  });
++
++  it("清空后按目标顺序重加，并标记加入时间被刷新", async () => {
++    stubNeteaseOrders([
++      ["a", "b", "c"], // beforeOrder
++      ["c", "a", "b"], // 写后校验
++    ]);
++
++    const result = await reorderPlaylistTracks(neteaseEntry, ["c", "a", "b"]);
++
++    expect(playlistTracksCalls().map(([, params]) => params)).toEqual([
++      { op: "del", pid: "123", tracks: "a,b,c" },
++      { op: "add", pid: "123", tracks: "b,a,c" },
++    ]);
++    expect(result.ok).toBe(true);
++    expect(result.afterOrder).toEqual(["c", "a", "b"]);
++    expect(result.addTimeRefreshed).toBe(true);
++  });
++
++  it("服务端没按目标顺序落地时回滚到重排前顺序", async () => {
++    stubNeteaseOrders([
++      ["a", "b", "c"], // beforeOrder
++      ["a", "b", "c"], // 写后校验：顺序没变（服务端没生效）
++      ["a", "b", "c"], // 回滚后的确认
++    ]);
++
++    const result = await reorderPlaylistTracks(neteaseEntry, ["c", "a", "b"]);
++
++    expect(result.ok).toBe(false);
++    expect(result.rolledBack).toBe(true);
++    expect(result.afterOrder).toEqual(["a", "b", "c"]);
++    expect(playlistTracksCalls().map(([name, params]) => [name, params.op])).toEqual([
++      ["playlist_tracks", "del"],
++      ["playlist_tracks", "add"],
++      ["playlist_tracks", "del"],
++      ["playlist_tracks", "add"],
++    ]);
++  });
++});
++
++describe("本机歌单重排", () => {
++  it("直接改 position，失败即抛错", async () => {
++    mocks.localGetTrackIds.mockReturnValue(["a", "b", "c"]);
++    mocks.localReorderTracks.mockReturnValue(true);
++
++    const result = await reorderPlaylistTracks(localEntry, ["b", "a", "c"]);
++
++    expect(mocks.localReorderTracks).toHaveBeenCalledWith("pl_1", ["b", "a", "c"]);
++    expect(result.affected).toBe(3);
++  });
++});
++
++describe("移动歌单内单曲", () => {
++  it("按最小位移算出目标顺序", async () => {
++    stubNeteaseOrders([
++      ["a", "b", "c", "d"], // beforeOrder
++      ["d", "a", "b", "c"], // 写后校验
++    ]);
++
++    const result = await movePlaylistTrack(neteaseEntry, "d", 1);
++
++    expect(result.afterOrder).toEqual(["d", "a", "b", "c"]);
++  });
++
++  it("目标位置越界时夹到两端，曲目不存在则报错", async () => {
++    stubNeteaseOrders([
++      ["a", "b", "c"], // beforeOrder
++      ["a", "b", "c"], // 写后校验
++    ]);
++
++    await expect(movePlaylistTrack(neteaseEntry, "c", 99)).resolves.toMatchObject({
++      afterOrder: ["a", "b", "c"],
++    });
++    await expect(movePlaylistTrack(neteaseEntry, "zzz", 1)).rejects.toThrow("不在该歌单中");
++  });
++});
+diff --git a/electron/main/services/mcp/playlists.ts b/electron/main/services/mcp/playlists.ts
+new file mode 100644
+index 0000000..13b18e2
+--- /dev/null
++++ b/electron/main/services/mcp/playlists.ts
+@@ -0,0 +1,548 @@
++import { callNetease } from "@main/apis/netease";
++import {
++  addPlaylistTracks as localAddTracks,
++  createPlaylist as localCreatePlaylist,
++  deletePlaylist as localDeletePlaylist,
++  getPlaylist,
++  getPlaylistTrackIds as localGetTrackIds,
++  getPlaylists,
++  removePlaylistTracks as localRemoveTracks,
++  reorderPlaylistTracks as localReorderTracks,
++  updatePlaylist as localUpdatePlaylist,
++} from "@main/database/playlists";
++import { songToTrack, type NeteaseRawSong, withPicSize } from "@shared/utils/netease";
++import type { Track } from "@shared/types/player";
++
++/** 曲目补尾单批上限，与渲染层 fetchPlaylist 保持一致 */
++const SONG_DETAIL_BATCH = 500;
++/** 单个歌单最多载入的曲目数，避免超大歌单撑爆队列 */
++const MAX_PLAYLIST_TRACKS = 2000;
++
++/** 网易云的写操作语义，必须原样告知调用方 */
++const NETEASE_HEAD_INSERT_NOTE =
++  "网易云新增曲目是逐个插到歌单开头：同一批 [A,B] 结果会变成 [B,A]。本服务内部已逆序提交，" +
++  "调用方只需按期望顺序传数组即可。";
++const NETEASE_REORDER_NOTE =
++  "网易云没有歌单内移动接口，重排用「清空后按目标顺序重加」实现：会刷新所有曲目的加入时间，" +
++  "且非原子（本服务已加校验与回滚）。";
++
++/** trackIds 可能是数字数组或对象数组（对象里带加入时间 at） */
++type RawTrackIds = (number | { id: number; at?: number })[] | undefined;
++
++/** 歌单接口原始字段（仅取用到的部分） */
++interface RawNeteasePlaylist {
++  id: number;
++  name: string;
++  trackCount?: number;
++  coverImgUrl?: string;
++  privacy?: number;
++  subscribed?: boolean;
++  creator?: { nickname?: string; userId?: number };
++  tracks?: NeteaseRawSong[];
++  trackIds?: RawTrackIds;
++}
++
++/** 外部可读的歌单条目 */
++export interface McpPlaylistEntry {
++  id: string;
++  name: string;
++  trackCount: number;
++  source: "local" | "netease";
++  owner?: string;
++  cover?: string;
++  /** 是否为当前账号自建（决定能否写） */
++  owned?: boolean;
++  /** 网易云隐私设置：0 公开 / 10 私密 */
++  privacy?: number;
++  /** 是否为收藏（非自建）歌单 */
++  subscribed?: boolean;
++}
++
++/** 写操作结果：一律带前后顺序快照，供调用方对账 */
++export interface PlaylistMutationResult {
++  ok: boolean;
++  /** 实际影响（新增/删除/重排）的曲目数 */
++  affected: number;
++  beforeOrder: string[];
++  afterOrder: string[];
++  /** 失败时是否已回滚到 beforeOrder */
++  rolledBack?: boolean;
++  /** 重排是否刷新了加入时间 */
++  addTimeRefreshed?: boolean;
++  note?: string;
++}
++
++/**
++ * 归一化 trackIds（服务端可能给数字或带 at 的对象）
++ * @param raw - 原始 trackIds
++ * @returns id 与加入时间
++ */
++export const normalizeRawTrackIds = (raw: RawTrackIds): { id: string; addTimeMs?: number }[] =>
++  (raw ?? []).map((item) =>
++    typeof item === "number"
++      ? { id: String(item) }
++      : { id: String(item.id), ...(item.at ? { addTimeMs: item.at } : {}) },
++  );
++
++/**
++ * 判断两个曲目 id 序列是否完全一致（数量、内容与顺序）
++ * @param left - 序列 A
++ * @param right - 序列 B
++ * @returns 是否一致
++ */
++export const isSameTrackOrder = (left: readonly string[], right: readonly string[]): boolean =>
++  left.length === right.length && left.every((id, index) => id === right[index]);
++
++/**
++ * 取当前网易云账号 uid
++ * @returns uid；未登录（匿名会话）时为 null
++ */
++export const getNeteaseUserId = async (): Promise<number | null> => {
++  const pick = (value: unknown): number | null =>
++    typeof value === "number" && value > 0 ? value : null;
++  try {
++    const { body } = await callNetease("login_status");
++    const uid = pick(body?.data?.profile?.userId) ?? pick(body?.data?.account?.id);
++    if (uid !== null) return uid;
++  } catch {
++    // 未登录时该接口会失败，继续用 user_account 兜底
++  }
++  try {
++    const { body } = await callNetease("user_account");
++    return pick(body?.profile?.userId) ?? pick(body?.account?.id);
++  } catch {
++    return null;
++  }
++};
++
++/** 本机歌单 → 外部条目 */
++const localEntries = (): McpPlaylistEntry[] =>
++  getPlaylists().map((item) => ({
++    id: item.id,
++    name: item.title,
++    trackCount: item.trackCount,
++    source: "local" as const,
++    owned: true,
++  }));
++
++/**
++ * 列出可播放的歌单：本机歌单 + 网易云账号歌单
++ * @returns 歌单条目与（网易云不可用时的）失败原因
++ */
++export const listPlaylists = async (): Promise<{
++  playlists: McpPlaylistEntry[];
++  neteaseError?: string;
++}> => {
++  const playlists = localEntries();
++  let neteaseError: string | undefined;
++  try {
++    const uid = await getNeteaseUserId();
++    if (uid === null) {
++      neteaseError = "网易云账号未登录，无法读取账号歌单";
++      return { playlists, neteaseError };
++    }
++    const { body } = await callNetease("user_playlist", { uid, limit: 1000, offset: 0 });
++    for (const raw of (body?.playlist ?? []) as RawNeteasePlaylist[]) {
++      const owned = raw.creator?.userId === uid;
++      playlists.push({
++        id: String(raw.id),
++        name: raw.name,
++        trackCount: raw.trackCount ?? 0,
++        source: "netease",
++        owner: raw.creator?.nickname,
++        cover: withPicSize(raw.coverImgUrl),
++        owned,
++        privacy: raw.privacy ?? 0,
++        subscribed: !owned,
++      });
++    }
++  } catch (error) {
++    neteaseError = error instanceof Error ? error.message : String(error);
++  }
++  return { playlists, neteaseError };
++};
++
++/**
++ * 按名称查找歌单，先精确匹配再去空白包含匹配
++ * @param name - 歌单名称
++ * @returns 命中的歌单条目；未命中时为 null
++ */
++export const findPlaylistByName = async (name: string): Promise<McpPlaylistEntry | null> => {
++  const { playlists } = await listPlaylists();
++  const target = name.trim();
++  const exact = playlists.filter((item) => item.name === target);
++  if (exact.length > 0) return exact.sort((a, b) => b.trackCount - a.trackCount)[0];
++  const fuzzy = playlists.filter((item) => item.name.includes(target));
++  if (fuzzy.length > 0) return fuzzy.sort((a, b) => b.trackCount - a.trackCount)[0];
++  return null;
++};
++
++/**
++ * 按 id 查找歌单
++ * @param id - 歌单 id
++ * @returns 歌单条目；未命中时为 null
++ */
++export const findPlaylistById = async (id: string): Promise<McpPlaylistEntry | null> => {
++  const { playlists } = await listPlaylists();
++  return playlists.find((item) => item.id === id) ?? null;
++};
++
++/** 拉取网易云歌单原始详情 */
++const fetchNeteasePlaylist = async (id: string): Promise<RawNeteasePlaylist> => {
++  const { body } = await callNetease("playlist_detail", { id });
++  const raw = body?.playlist as RawNeteasePlaylist | undefined;
++  if (!raw) throw new Error(`未找到歌单 ${id}`);
++  return raw;
++};
++
++/**
++ * 载入歌单曲目
++ * @param entry - 歌单条目
++ * @returns 歌单名、曲目、全量 id 顺序、加入时间与是否截断
++ */
++export const loadPlaylistTracks = async (
++  entry: McpPlaylistEntry,
++): Promise<{
++  name: string;
++  total: number;
++  tracks: Track[];
++  trackIds: string[];
++  addTimes: Record<string, number>;
++  truncated: boolean;
++}> => {
++  if (entry.source === "local") {
++    const detail = getPlaylist(entry.id);
++    if (!detail) throw new Error(`未找到本机歌单 ${entry.id}`);
++    const trackIds = localGetTrackIds(entry.id);
++    return {
++      name: detail.title,
++      total: detail.trackCount,
++      tracks: detail.tracks.slice(0, MAX_PLAYLIST_TRACKS),
++      trackIds,
++      addTimes: {},
++      truncated: detail.tracks.length > MAX_PLAYLIST_TRACKS,
++    };
++  }
++
++  const raw = await fetchNeteasePlaylist(entry.id);
++  const tracks = (raw.tracks ?? []).map(songToTrack);
++  const ids = normalizeRawTrackIds(raw.trackIds);
++  // playlist_detail 只返回前若干首完整歌曲，剩余按 trackIds 分批补尾
++  const have = new Set(tracks.map((track) => track.id));
++  const missing = ids.map((item) => item.id).filter((id) => !have.has(id));
++  for (
++    let i = 0;
++    i < missing.length && tracks.length < MAX_PLAYLIST_TRACKS;
++    i += SONG_DETAIL_BATCH
++  ) {
++    const chunk = missing.slice(i, i + SONG_DETAIL_BATCH);
++    const { body: detail } = await callNetease("song_detail", { ids: chunk.join(",") });
++    for (const song of (detail?.songs ?? []) as NeteaseRawSong[]) tracks.push(songToTrack(song));
++  }
++
++  const addTimes: Record<string, number> = {};
++  for (const item of ids) if (item.addTimeMs) addTimes[item.id] = item.addTimeMs;
++
++  return {
++    name: raw.name,
++    total: raw.trackCount ?? tracks.length,
++    tracks: orderTracksByIds(
++      tracks,
++      ids.map((item) => item.id),
++    ),
++    trackIds: ids.map((item) => item.id),
++    addTimes,
++    truncated: tracks.length > MAX_PLAYLIST_TRACKS,
++  };
++};
++
++/**
++ * 按 trackIds 顺序重排曲目对象
++ * @param tracks - 曲目对象（可能含截断补尾的额外项）
++ * @param order - 期望的 id 顺序
++ * @returns 按 order 排列的曲目
++ */
++const orderTracksByIds = (tracks: Track[], order: string[]): Track[] => {
++  const byId = new Map(tracks.map((track) => [track.id, track]));
++  const ordered = order.flatMap((id) => {
++    const track = byId.get(id);
++    return track ? [track] : [];
++  });
++  const seen = new Set(ordered.map((track) => track.id));
++  return [...ordered, ...tracks.filter((track) => !seen.has(track.id))];
++};
++
++/**
++ * 取歌单当前曲目 id 顺序（本机与网易云统一）
++ * @param entry - 歌单条目
++ * @returns 曲目 id 顺序
++ */
++export const getPlaylistOrder = async (entry: McpPlaylistEntry): Promise<string[]> => {
++  if (entry.source === "local") return localGetTrackIds(entry.id);
++  const raw = await fetchNeteasePlaylist(entry.id);
++  return normalizeRawTrackIds(raw.trackIds).map((item) => item.id);
++};
++
++/**
++ * 向歌单新增曲目
++ * @param entry - 歌单条目
++ * @param trackIds - 曲目 id 列表（按期望顺序传入）
++ * @returns 前后顺序快照
++ */
++export const addPlaylistTracks = async (
++  entry: McpPlaylistEntry,
++  trackIds: string[],
++): Promise<PlaylistMutationResult> => {
++  const ids = [...new Set(trackIds.map((id) => String(id).trim()).filter(Boolean))];
++  if (ids.length === 0) throw new Error("trackIds 不能为空");
++  const beforeOrder = await getPlaylistOrder(entry);
++
++  if (entry.source === "local") {
++    const affected = localAddTracks(entry.id, ids);
++    return { ok: true, affected, beforeOrder, afterOrder: await getPlaylistOrder(entry) };
++  }
++
++  // 逆序提交，让歌单最终顺序与传入顺序一致
++  await callNetease("playlist_tracks", {
++    op: "add",
++    pid: entry.id,
++    tracks: [...ids].reverse().join(","),
++  });
++  const afterOrder = await getPlaylistOrder(entry);
++  return {
++    ok: true,
++    affected: Math.max(0, afterOrder.length - beforeOrder.length),
++    beforeOrder,
++    afterOrder,
++    note: NETEASE_HEAD_INSERT_NOTE,
++  };
++};
++
++/**
++ * 从歌单移除曲目
++ * @param entry - 歌单条目
++ * @param trackIds - 曲目 id 列表
++ * @returns 前后顺序快照
++ */
++export const removePlaylistTracks = async (
++  entry: McpPlaylistEntry,
++  trackIds: string[],
++): Promise<PlaylistMutationResult> => {
++  const ids = [...new Set(trackIds.map((id) => String(id).trim()).filter(Boolean))];
++  if (ids.length === 0) throw new Error("trackIds 不能为空");
++  const beforeOrder = await getPlaylistOrder(entry);
++
++  if (entry.source === "local") {
++    const affected = localRemoveTracks(entry.id, ids);
++    return { ok: true, affected, beforeOrder, afterOrder: await getPlaylistOrder(entry) };
++  }
++
++  await callNetease("playlist_tracks", { op: "del", pid: entry.id, tracks: ids.join(",") });
++  const afterOrder = await getPlaylistOrder(entry);
++  return {
++    ok: true,
++    affected: Math.max(0, beforeOrder.length - afterOrder.length),
++    beforeOrder,
++    afterOrder,
++  };
++};
++
++/**
++ * 重排歌单曲序
++ *
++ * 本机歌单直接改 position（原子）；网易云只能删光重加（逆序提交），写后校验，不一致则回滚。
++ * @param entry - 歌单条目
++ * @param orderedIds - 期望的完整顺序
++ * @returns 前后顺序快照与回滚状态
++ */
++export const reorderPlaylistTracks = async (
++  entry: McpPlaylistEntry,
++  orderedIds: string[],
++): Promise<PlaylistMutationResult> => {
++  const beforeOrder = await getPlaylistOrder(entry);
++  const desired = orderedIds.map((id) => String(id).trim()).filter(Boolean);
++  if (desired.length !== beforeOrder.length) {
++    throw new Error(
++      `顺序数组必须与当前曲目集合一致：歌单有 ${beforeOrder.length} 首，收到 ${desired.length} 个 id`,
++    );
++  }
++  if (!isSameTrackOrder([...desired].sort(), [...beforeOrder].sort())) {
++    throw new Error("顺序数组包含不属于该歌单的 id，或漏掉了现有曲目");
++  }
++  if (isSameTrackOrder(beforeOrder, desired)) {
++    return { ok: true, affected: 0, beforeOrder, afterOrder: beforeOrder };
++  }
++
++  if (entry.source === "local") {
++    if (!localReorderTracks(entry.id, desired)) throw new Error("本机歌单重排失败");
++    return {
++      ok: true,
++      affected: desired.length,
++      beforeOrder,
++      afterOrder: await getPlaylistOrder(entry),
++    };
++  }
++
++  await callNetease("playlist_tracks", { op: "del", pid: entry.id, tracks: beforeOrder.join(",") });
++  await callNetease("playlist_tracks", {
++    op: "add",
++    pid: entry.id,
++    tracks: [...desired].reverse().join(","),
++  });
++  let afterOrder = await getPlaylistOrder(entry);
++
++  if (!isSameTrackOrder(afterOrder, desired)) {
++    await callNetease("playlist_tracks", {
++      op: "del",
++      pid: entry.id,
++      tracks: afterOrder.join(","),
++    });
++    await callNetease("playlist_tracks", {
++      op: "add",
++      pid: entry.id,
++      tracks: [...beforeOrder].reverse().join(","),
++    });
++    afterOrder = await getPlaylistOrder(entry);
++    return {
++      ok: false,
++      affected: 0,
++      beforeOrder,
++      afterOrder,
++      rolledBack: isSameTrackOrder(afterOrder, beforeOrder),
++      addTimeRefreshed: true,
++      note: NETEASE_REORDER_NOTE,
++    };
++  }
++
++  return {
++    ok: true,
++    affected: desired.length,
++    beforeOrder,
++    afterOrder,
++    addTimeRefreshed: true,
++    note: NETEASE_REORDER_NOTE,
++  };
++};
++
++/**
++ * 移动单首曲目到指定位置（1-based）
++ * @param entry - 歌单条目
++ * @param trackId - 要移动的曲目 id
++ * @param toIndex - 目标位置，从 1 开始
++ * @returns 前后顺序快照与回滚状态
++ */
++export const movePlaylistTrack = async (
++  entry: McpPlaylistEntry,
++  trackId: string,
++  toIndex: number,
++): Promise<PlaylistMutationResult> => {
++  const order = await getPlaylistOrder(entry);
++  const from = order.indexOf(String(trackId));
++  if (from < 0) throw new Error(`曲目 ${trackId} 不在该歌单中`);
++  const to = Math.max(1, Math.min(Math.trunc(toIndex), order.length)) - 1;
++  if (from === to) {
++    return { ok: true, affected: 0, beforeOrder: order, afterOrder: order };
++  }
++  const next = [...order];
++  next.splice(from, 1);
++  next.splice(to, 0, String(trackId));
++  return reorderPlaylistTracks(entry, next);
++};
++
++/**
++ * 新建歌单
++ * @param input - 名称、来源（默认网易云）、是否私密与可选初始曲目
++ * @returns 新歌单 id、名称、来源与实际写入数量
++ */
++export const createPlaylist = async (input: {
++  name: string;
++  source?: "local" | "netease";
++  isPrivate?: boolean;
++  trackIds?: string[];
++}): Promise<{ id: string; name: string; source: "local" | "netease"; added: number }> => {
++  const title = input.name.trim();
++  if (!title) throw new Error("歌单名称不能为空");
++  const trackIds = input.trackIds ?? [];
++
++  if (input.source === "local") {
++    const created = localCreatePlaylist({ title, type: "local" });
++    const added = trackIds.length > 0 ? localAddTracks(created.id, trackIds) : 0;
++    return { id: created.id, name: created.title, source: "local", added };
++  }
++
++  const { body } = await callNetease("playlist_create", {
++    name: title,
++    privacy: input.isPrivate ? 10 : 0,
++  });
++  const id = body?.id ?? body?.playlist?.id;
++  if (!id) throw new Error("网易云未返回新歌单 id");
++  const entry: McpPlaylistEntry = {
++    id: String(id),
++    name: title,
++    trackCount: 0,
++    source: "netease",
++    owned: true,
++  };
++  const added = trackIds.length > 0 ? (await addPlaylistTracks(entry, trackIds)).affected : 0;
++  return { id: String(id), name: title, source: "netease", added };
++};
++
++/**
++ * 重命名歌单
++ * @param entry - 歌单条目
++ * @param name - 新名称
++ * @returns 是否成功
++ */
++export const renamePlaylist = async (entry: McpPlaylistEntry, name: string): Promise<void> => {
++  const title = name.trim();
++  if (!title) throw new Error("歌单名称不能为空");
++  if (entry.source === "local") {
++    localUpdatePlaylist(entry.id, { title });
++    return;
++  }
++  await callNetease("playlist_name_update", { id: entry.id, name: title });
++};
++
++/**
++ * 修改歌单简介
++ * @param entry - 歌单条目
++ * @param description - 新简介，空串清空
++ * @returns 是否成功
++ */
++export const updatePlaylistDescription = async (
++  entry: McpPlaylistEntry,
++  description: string,
++): Promise<void> => {
++  if (entry.source === "local") {
++    localUpdatePlaylist(entry.id, { description });
++    return;
++  }
++  await callNetease("playlist_desc_update", { id: entry.id, desc: description });
++};
++
++/**
++ * 删除歌单
++ * @param entry - 歌单条目
++ */
++export const deletePlaylist = async (entry: McpPlaylistEntry): Promise<void> => {
++  if (entry.source === "local") {
++    localDeletePlaylist(entry.id);
++    return;
++  }
++  await callNetease("playlist_delete", { id: entry.id });
++};
++
++/**
++ * 收藏或取消收藏歌单（仅网易云）
++ * @param entry - 歌单条目
++ * @param subscribed - true 收藏 / false 取消
++ */
++export const setPlaylistSubscribed = async (
++  entry: McpPlaylistEntry,
++  subscribed: boolean,
++): Promise<void> => {
++  if (entry.source === "local") {
++    throw new Error("本机歌单不需要收藏操作");
++  }
++  await callNetease("playlist_subscribe", { id: entry.id, t: subscribed ? 1 : 2 });
++};
+diff --git a/electron/main/services/mcp/podcasts.ts b/electron/main/services/mcp/podcasts.ts
+new file mode 100644
+index 0000000..7bba9de
+--- /dev/null
++++ b/electron/main/services/mcp/podcasts.ts
+@@ -0,0 +1,150 @@
++import { callNetease } from "@main/apis/netease";
++import { programToTrack, toDjRadio } from "@shared/utils/radio";
++import type { NeteaseDjProgram, NeteaseDjRadio } from "@shared/types/radio";
++import type { Playlist, Track } from "@shared/types/player";
++import { getNeteaseUserId } from "./playlists";
++
++/** 订阅列表分页大小与安全上限 */
++const SUBLIST_PAGE_SIZE = 100;
++const SUBLIST_MAX = 2000;
++/** 单次最多载入的节目数（电台可达上千集，MCP 侧按需取） */
++const PROGRAM_LIMIT_MAX = 600;
++
++/** 外部可读的节目条目 */
++export interface McpPodcastProgram {
++  /** 电台内的序号（从 1 开始，最新在前） */
++  index: number;
++  /** 节目 id */
++  programId: string;
++  /** 取址用的歌曲 id（= mainTrackId） */
++  trackId: string;
++  title: string;
++  durationMs: number;
++  listenerCount?: number;
++  createTimeMs?: number;
++  serialNum?: number;
++}
++
++/** 外部可读的电台条目 */
++export interface McpPodcastEntry extends Playlist {
++  /** 主播昵称 */
++  owner?: string;
++}
++
++/**
++ * 我订阅的播客（/dj/sublist，仅登录态可用）
++ * @returns 订阅的电台列表
++ */
++export const listSubscribedPodcasts = async (): Promise<{
++  podcasts: McpPodcastEntry[];
++  loggedIn: boolean;
++}> => {
++  const uid = await getNeteaseUserId();
++  if (uid === null) return { podcasts: [], loggedIn: false };
++
++  const podcasts: McpPodcastEntry[] = [];
++  for (let offset = 0; offset < SUBLIST_MAX; offset += SUBLIST_PAGE_SIZE) {
++    const { body } = await callNetease("dj_sublist", { limit: SUBLIST_PAGE_SIZE, offset });
++    const page = ((body?.djRadios ?? []) as NeteaseDjRadio[]).map(toDjRadio);
++    podcasts.push(...page);
++    if (page.length < SUBLIST_PAGE_SIZE) break;
++  }
++  return { podcasts, loggedIn: true };
++};
++
++/**
++ * 搜索播客（cloudsearch type 1009）
++ * @param keyword - 关键词
++ * @param limit - 返回数量
++ * @returns 命中的电台
++ */
++export const searchPodcasts = async (
++  keyword: string,
++  limit: number,
++): Promise<McpPodcastEntry[]> => {
++  const { body } = await callNetease("cloudsearch", {
++    keywords: keyword,
++    type: 1009,
++    limit,
++    offset: 0,
++  });
++  const radios = (body?.result?.djRadios ?? []) as NeteaseDjRadio[];
++  return radios.slice(0, limit).map(toDjRadio);
++};
++
++/**
++ * 电台详情 + 节目列表
++ * @param rid - 电台 id
++ * @param offset - 节目偏移（0 起）
++ * @param limit - 节目数量
++ * @returns 电台信息与节目
++ */
++export const getPodcast = async (
++  rid: string,
++  offset: number,
++  limit: number,
++): Promise<{
++  podcast: McpPodcastEntry | null;
++  programs: McpPodcastProgram[];
++  total: number;
++  hasMore: boolean;
++}> => {
++  const { body: detail } = await callNetease("dj_detail", { rid });
++  const raw = detail?.data as NeteaseDjRadio | undefined;
++  if (!raw) return { podcast: null, programs: [], total: 0, hasMore: false };
++
++  const { body } = await callNetease("dj_program", { rid, limit, offset, asc: false });
++  const programs = ((body?.programs ?? []) as NeteaseDjProgram[]).map((program, position) => ({
++    index: offset + position + 1,
++    programId: String(program.id),
++    trackId: String(program.mainSong?.id ?? program.mainTrackId ?? ""),
++    title: program.name,
++    durationMs: program.duration ?? program.mainSong?.duration ?? program.mainSong?.dt ?? 0,
++    ...(program.listenerCount != null ? { listenerCount: program.listenerCount } : {}),
++    ...(program.createTime != null ? { createTimeMs: program.createTime } : {}),
++    ...(program.serialNum != null ? { serialNum: program.serialNum } : {}),
++  }));
++
++  return {
++    podcast: toDjRadio(raw),
++    programs,
++    total: body?.count ?? raw.programCount ?? programs.length,
++    hasMore: programs.length === limit && offset + limit < (body?.count ?? Infinity),
++  };
++};
++
++/**
++ * 载入电台的节目为可播放曲目
++ * @param rid - 电台 id
++ * @param max - 最多载入多少集（最新在前）
++ * @returns 电台信息与曲目
++ */
++export const loadPodcastTracks = async (
++  rid: string,
++  max: number,
++): Promise<{ podcast: McpPodcastEntry | null; tracks: Track[] }> => {
++  const { body: detail } = await callNetease("dj_detail", { rid });
++  const raw = detail?.data as NeteaseDjRadio | undefined;
++  if (!raw) return { podcast: null, tracks: [] };
++
++  const capped = Math.min(Math.max(max, 1), PROGRAM_LIMIT_MAX);
++  const tracks: Track[] = [];
++  const pageSize = 200;
++  for (let offset = 0; offset < capped; offset += pageSize) {
++    const { body } = await callNetease("dj_program", {
++      rid,
++      limit: Math.min(pageSize, capped - offset),
++      offset,
++      asc: false,
++    });
++    const programs = (body?.programs ?? []) as NeteaseDjProgram[];
++    for (const program of programs) {
++      const track = programToTrack(program, raw);
++      if (track) tracks.push(track);
++    }
++    if (programs.length < pageSize) break;
++    // 连续大分页会触发网易云 405/406 风控
++    await new Promise((resolve) => setTimeout(resolve, 400));
++  }
++  return { podcast: toDjRadio(raw), tracks };
++};
+diff --git a/electron/main/services/mcp/server.ts b/electron/main/services/mcp/server.ts
+index ffe7ae8..7ab0645 100644
+--- a/electron/main/services/mcp/server.ts
++++ b/electron/main/services/mcp/server.ts
+@@ -5,6 +5,8 @@ import { getPlayer } from "@main/services/engine";
+ import { playerControl } from "@main/services/playerControl";
+ import * as nowPlaying from "@main/services/nowPlaying";
+ import type { Track } from "@shared/types/player";
++import type { LyricLine } from "@shared/types/lyrics";
++import { QUEUE_WINDOW_RADIUS } from "@shared/types/nowPlaying";
+ import {
+   getAlbumList,
+   getArtistList,
+@@ -16,12 +18,164 @@ import { toMs } from "@main/utils/time";
+ import { getTrayPlayMode } from "@main/services/tray";
+ import { createMcpEndpoint as createHttpEndpoint, type McpEndpoint } from "./endpoint";
+ import { searchOnlineTracks } from "./onlineSearch";
++import { getPodcast, listSubscribedPodcasts, loadPodcastTracks, searchPodcasts } from "./podcasts";
++import {
++  addPlaylistTracks,
++  createPlaylist,
++  deletePlaylist,
++  findPlaylistById,
++  findPlaylistByName,
++  isSameTrackOrder,
++  listPlaylists,
++  loadPlaylistTracks,
++  movePlaylistTrack,
++  removePlaylistTracks,
++  renamePlaylist,
++  reorderPlaylistTracks,
++  setPlaylistSubscribed,
++  updatePlaylistDescription,
++  type McpPlaylistEntry,
++  type PlaylistMutationResult,
++} from "./playlists";
++import { listLikedTracks } from "./likes";
+ import { cacheTracks, getTrackById, getTracksByIds } from "./cache";
+ 
+ const jsonContent = (value: unknown) => ({
+   content: [{ type: "text" as const, text: JSON.stringify(value) }],
+ });
+ 
++/**
++ * 定位当前激活的歌词行下标
++ * @param lines - 解析后的歌词行
++ * @param timeMs - 已叠加歌词偏移的播放位置
++ * @returns 激活行下标；尚未进入第一行时为 -1
++ */
++const findActiveLyricIndex = (lines: LyricLine[], timeMs: number): number => {
++  let active = -1;
++  for (let index = 0; index < lines.length; index++) {
++    const start = lines[index].words[0]?.startTime ?? lines[index].startTime;
++    if (start > timeMs) break;
++    active = index;
++  }
++  return active;
++};
++
++/** 把曲目裁成外部可读的精简形式（去掉封面、音质等与上下文无关的字段） */
++const toTrackSummary = (track: Track) => ({
++  id: track.id,
++  source: track.source,
++  title: track.title,
++  artists: track.artists.map((artist) => artist.name),
++  album: track.album?.name,
++  durationMs: track.duration,
++});
++
++/** 歌单定位参数：id 优先，其次按名称（支持部分匹配） */
++const playlistSelector = {
++  id: z.string().trim().min(1).optional(),
++  name: z.string().trim().min(1).optional(),
++};
++
++/**
++ * 按 id 或名称定位歌单
++ * @param id - 歌单 id
++ * @param name - 歌单名称
++ * @returns 歌单条目
++ */
++const resolvePlaylist = async (
++  id: string | undefined,
++  name: string | undefined,
++): Promise<McpPlaylistEntry> => {
++  const entry = id ? await findPlaylistById(id) : await findPlaylistByName(name ?? "");
++  if (!entry) {
++    throw new Error(
++      id
++        ? `未找到歌单 id=${id}；可用 list_playlists 查询`
++        : `未找到歌单「${name ?? ""}」；可用 list_playlists 查询`,
++    );
++  }
++  return entry;
++};
++
++/** 切歌落地的最长等待与轮询间隔（毫秒） */
++const TRACK_SWITCH_WAIT_MS = 3000;
++const TRACK_SWITCH_POLL_MS = 100;
++
++/**
++ * 等待切歌落地
++ *
++ * playList 只是把指令交给渲染层，主进程快照由渲染层回推，需要等一小会儿才能观测到真实结果。
++ * @param trackId - 期望播放的曲目 id
++ * @returns 是否在等待窗口内观测到目标曲目
++ */
++const waitForTrackSwitch = async (trackId: string): Promise<boolean> => {
++  const deadline = Date.now() + TRACK_SWITCH_WAIT_MS;
++  for (;;) {
++    if (nowPlaying.snapshot().track?.id === trackId) return true;
++    if (Date.now() >= deadline) return false;
++    await new Promise((resolve) => setTimeout(resolve, TRACK_SWITCH_POLL_MS));
++  }
++};
++
++/** 歌单曲序变更的通用返回：一律带前后顺序，顺序错位靠对账发现而不是靠报错 */
++const mutationContent = (result: PlaylistMutationResult) =>
++  jsonContent({ ...result, changed: !isSameTrackOrder(result.beforeOrder, result.afterOrder) });
++
++/** 把歌词行压成外部可读的精简形式 */
++const toLyricEntry = (line: LyricLine, index: number, activeIndex: number) => ({
++  index,
++  isActive: index === activeIndex,
++  startTime: line.startTime,
++  text: line.words.map((word) => word.word).join(""),
++  ...(line.translatedLyric ? { translation: line.translatedLyric } : {}),
++  ...(line.romanLyric ? { roman: line.romanLyric } : {}),
++});
++
++/**
++ * 取当前播放位置附近的歌词窗口，避免外部客户端读取整份歌词
++ * @param contextLines - 当前行上下各取的行数
++ */
++const lyricWindow = (contextLines: number) => {
++  const snap = nowPlaying.snapshot();
++  const timeMs = snap.position + snap.lyricOffsetMs;
++  const activeIndex = findActiveLyricIndex(snap.lyric, timeMs);
++  if (activeIndex < 0) {
++    return { activeIndex: -1, total: snap.lyric.length, timeMs, lines: [] };
++  }
++  const start = Math.max(0, activeIndex - contextLines);
++  const end = Math.min(snap.lyric.length - 1, activeIndex + contextLines);
++  return {
++    activeIndex,
++    total: snap.lyric.length,
++    timeMs,
++    lines: snap.lyric
++      .slice(start, end + 1)
++      .map((line, offset) => toLyricEntry(line, start + offset, activeIndex)),
++  };
++};
++
++/**
++ * 取播放队列窗口
++ * @param contextTracks - 当前曲目前后各保留几首（上限为推送窗口半径）
++ * @returns 队列摘要；渲染进程尚未同步时为 null
++ */
++const queueContext = (contextTracks: number) => {
++  const snap = nowPlaying.queueSnapshot();
++  if (!snap) return null;
++  const radius = Math.min(contextTracks, QUEUE_WINDOW_RADIUS);
++  // 索引未定位时退化为整个已推送窗口
++  const offset = snap.index >= 0 ? snap.index - snap.startIndex : -1;
++  const from = offset >= 0 ? Math.max(0, offset - radius) : 0;
++  const to = offset >= 0 ? Math.min(snap.tracks.length, offset + radius + 1) : snap.tracks.length;
++  return {
++    index: snap.index,
++    total: snap.total,
++    tracks: snap.tracks
++      .slice(from, to)
++      .map((track, i) => ({ index: snap.startIndex + from + i, ...track })),
++  };
++};
++
+ /** 创建并注册 SPlayer MCP 能力 */
+ const createServer = (): McpServer => {
+   const server = new McpServer({
+@@ -61,6 +215,64 @@ const createServer = (): McpServer => {
+     () => jsonContent(nowPlaying.lightSnapshot()),
+   );
+ 
++  server.registerTool(
++    "get_lyric_window",
++    {
++      title: "获取当前歌词片段",
++      description:
++        "返回当前播放位置附近的歌词行（含翻译与音译），默认上下各 3 行，避免读取整份歌词。时间单位为毫秒",
++      inputSchema: { context: z.number().int().min(0).max(10).default(3) },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    ({ context }) => jsonContent(lyricWindow(context)),
++  );
++
++  server.registerTool(
++    "get_queue",
++    {
++      title: "获取播放队列",
++      description: `返回播放队列的当前下标、总长，以及当前曲目前后各最多 ${QUEUE_WINDOW_RADIUS} 首`,
++      inputSchema: { context: z.number().int().min(0).max(QUEUE_WINDOW_RADIUS).default(3) },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    ({ context }) => {
++      const queue = queueContext(context);
++      if (!queue) return jsonContent({ index: -1, total: 0, tracks: [] });
++      const playMode = getTrayPlayMode();
++      return jsonContent({ ...queue, repeat: playMode.repeat, shuffle: playMode.shuffle });
++    },
++  );
++
++  server.registerTool(
++    "get_playback_context",
++    {
++      title: "获取播放上下文",
++      description:
++        "一次性返回当前歌曲、播放状态、当前歌词附近的 3 行，以及队列下标与紧接着的 3 首，适合需要整体上下文时替代多次调用",
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    () => {
++      const status = getPlayer().getStatus();
++      const playMode = getTrayPlayMode();
++      const queue = queueContext(3);
++      const currentTrack = nowPlaying.lightSnapshot().track;
++      const upcoming = queue
++        ? queue.tracks.filter((track) => track.index > queue.index).slice(0, 3)
++        : [];
++      return jsonContent({
++        track: currentTrack ? toTrackSummary(currentTrack) : null,
++        state: status.state,
++        positionMs: toMs(status.position),
++        durationMs: toMs(status.duration),
++        volume: status.volume,
++        repeat: playMode.repeat,
++        shuffle: playMode.shuffle,
++        lyric: lyricWindow(1),
++        queue: queue ? { index: queue.index, total: queue.total, upcoming } : null,
++      });
++    },
++  );
++
+   const controls = [
+     ["play", "继续播放", () => playerControl.play()],
+     ["pause", "暂停播放", () => playerControl.pause()],
+@@ -139,6 +351,376 @@ const createServer = (): McpServer => {
+     },
+   );
+ 
++  server.registerTool(
++    "list_playlists",
++    {
++      title: "列出歌单",
++      description: "列出本机歌单与网易云账号歌单，返回 id、名称、曲目数与来源",
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async () => jsonContent(await listPlaylists()),
++  );
++
++  server.registerTool(
++    "play_playlist",
++    {
++      title: "播放歌单",
++      description:
++        "把指定歌单整体载入播放队列并开始播放（index 从 1 开始，默认 1）。歌单用 id 或 name（支持部分匹配）指定。" +
++        "歌单里有同名曲目时不要按序号点歌，改用 trackId 指定（可先调 get_playlist_tracks 取 id）。" +
++        "返回的 index 是本次入队时的目标位置，actualTrack 是等待后实际观测到的播放曲目；" +
++        "若随机播放开启，队列下标会被洗牌重置，以 get_queue 的 tracks[].index 为准。载入后队列即为该歌单，next/prev 都在歌单内",
++      inputSchema: {
++        ...playlistSelector,
++        index: z.number().int().min(1).default(1),
++        trackId: z.string().trim().min(1).optional(),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    async ({ name, id, index, trackId }) => {
++      const entry = await resolvePlaylist(id, name);
++      const { name: title, total, tracks, truncated } = await loadPlaylistTracks(entry);
++      if (tracks.length === 0) throw new Error(`歌单「${title}」没有可播放的曲目`);
++
++      let start = Math.min(index - 1, tracks.length - 1);
++      if (trackId) {
++        const found = tracks.findIndex((track) => track.id === trackId);
++        if (found < 0) throw new Error(`曲目 ${trackId} 不在歌单「${title}」中`);
++        start = found;
++      }
++
++      playerControl.playList(tracks, start, {
++        provider: entry.source === "netease" ? "netease" : undefined,
++        originId: entry.id,
++        originType: "playlist",
++        originName: title,
++      });
++
++      const target = tracks[start];
++      const matched = await waitForTrackSwitch(target.id);
++      const current = matched ? target : nowPlaying.lightSnapshot().track;
++      const playMode = getTrayPlayMode();
++      return jsonContent({
++        ok: true,
++        playlist: { id: entry.id, name: title, source: entry.source, total },
++        index: start + 1,
++        track: toTrackSummary(target),
++        actualTrack: current ? toTrackSummary(current) : null,
++        ...(matched
++          ? {}
++          : { note: `切歌后 ${TRACK_SWITCH_WAIT_MS}ms 内未观测到目标曲目开始播放，可能音源受限` }),
++        ...(playMode.shuffle === "on"
++          ? { shuffleNote: "随机播放已开启，队列下标被洗牌重置，实际播放下标请以 get_queue 为准" }
++          : {}),
++        truncated,
++      });
++    },
++  );
++
++  server.registerTool(
++    "list_podcasts",
++    {
++      title: "我订阅的播客",
++      description:
++        "列出当前网易云账号订阅的电台（播客）。未登录时返回 loggedIn=false。配合 get_podcast_tracks 取节目、play_podcast 播放",
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async () => jsonContent(await listSubscribedPodcasts()),
++  );
++
++  server.registerTool(
++    "search_podcasts",
++    {
++      title: "搜索播客",
++      description:
++        "按关键词搜索网易云电台（播客），返回可直接传给 get_podcast_tracks / play_podcast 的电台 id",
++      inputSchema: {
++        query: z.string().trim().min(1).max(200),
++        limit: z.number().int().min(1).max(50).default(10),
++      },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async ({ query, limit }) => jsonContent({ podcasts: await searchPodcasts(query, limit) }),
++  );
++
++  server.registerTool(
++    "get_podcast_tracks",
++    {
++      title: "读取播客节目",
++      description:
++        "读取某个电台（播客）的信息与节目列表（分页，最新在前）。节目里 trackId 是取址用的歌曲 id、programId 是节目 id；" +
++        "电台 id 可从 list_podcasts / search_podcasts 得到，或用界面的播客页进入",
++      inputSchema: {
++        rid: z.string().trim().min(1),
++        offset: z.number().int().min(0).default(0),
++        limit: z.number().int().min(1).max(200).default(30),
++      },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async ({ rid, offset, limit }) => jsonContent(await getPodcast(rid, offset, limit)),
++  );
++
++  server.registerTool(
++    "play_podcast",
++    {
++      title: "播放播客节目",
++      description:
++        "把某电台的节目整体载入播放队列并开始播放（整条替换队列，next/prev 都在该电台内）。" +
++        "定位方式：传 programId（节目 id，精确）或 index（第 N 集，从 1 开始，最新在前），都不传则从第 1 集开始。" +
++        "队列只载入最近 maxEpisodes 集，避免上千集一次性入队",
++      inputSchema: {
++        rid: z.string().trim().min(1),
++        programId: z.string().trim().min(1).optional(),
++        index: z.number().int().min(1).optional(),
++        maxEpisodes: z.number().int().min(1).max(600).default(200),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    async ({ rid, programId, index, maxEpisodes }) => {
++      const wanted = index ?? 1;
++      // 目标可能超出默认载入量，按需扩到目标序号
++      const target = await loadPodcastTracks(rid, Math.max(maxEpisodes, programId ? 1 : wanted));
++      if (!target.podcast || target.tracks.length === 0) {
++        throw new Error(`未找到电台 ${rid} 的节目（id 是否正确？可用 search_podcasts 查询）`);
++      }
++      let start = Math.min(wanted - 1, target.tracks.length - 1);
++      if (programId) {
++        const found = target.tracks.findIndex((track) => track.extId === programId);
++        if (found < 0) {
++          throw new Error(
++            `节目 ${programId} 不在已载入的 ${target.tracks.length} 集里，可用 get_podcast_tracks 核对`,
++          );
++        }
++        start = found;
++      }
++      const current = target.tracks.slice(0, Math.max(start + 1, maxEpisodes));
++      playerControl.playList(current, start, {
++        provider: "netease",
++        originId: target.podcast.id ?? rid,
++        originType: "radio",
++        originName: target.podcast.name,
++      });
++      const playing = current[start];
++      const matched = playing ? await waitForTrackSwitch(playing.id) : false;
++      return jsonContent({
++        ok: true,
++        podcast: { id: target.podcast.id, name: target.podcast.name, owner: target.podcast.owner },
++        episode: playing
++          ? {
++              index: start + 1,
++              programId: playing.extId,
++              trackId: playing.id,
++              title: playing.title,
++            }
++          : null,
++        queued: current.length,
++        ...(matched ? {} : { note: "切歌后未观测到目标节目开始播放，可能音源受限或需要登录" }),
++      });
++    },
++  );
++
++  server.registerTool(
++    "get_playlist_tracks",
++    {
++      title: "读取歌单曲目",
++      description:
++        "读取歌单的曲目与完整 id 顺序（分页返回曲目详情，trackIds 永远是全量顺序）。" +
++        "网易云的 playlist_detail 会截断曲目对象，本工具已按 trackIds + song_detail 补全；" +
++        "重排歌单前应先调它拿到全量 trackIds。私密歌单走播放器登录态，匿名 HTTP 读不到的内容这里能读",
++      inputSchema: {
++        ...playlistSelector,
++        offset: z.number().int().min(0).default(0),
++        limit: z.number().int().min(1).max(500).default(100),
++        includeAddTime: z.boolean().default(false),
++      },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async ({ name, id, offset, limit, includeAddTime }) => {
++      const entry = await resolvePlaylist(id, name);
++      const loaded = await loadPlaylistTracks(entry);
++      return jsonContent({
++        playlist: {
++          id: entry.id,
++          name: loaded.name,
++          source: entry.source,
++          total: loaded.total,
++        },
++        total: loaded.trackIds.length,
++        trackIds: loaded.trackIds,
++        offset,
++        limit,
++        tracks: loaded.tracks
++          .slice(offset, offset + limit)
++          .map((track, position) => ({ index: offset + position + 1, ...toTrackSummary(track) })),
++        ...(includeAddTime ? { addTimes: loaded.addTimes } : {}),
++        truncated: loaded.truncated,
++      });
++    },
++  );
++
++  server.registerTool(
++    "add_playlist_tracks",
++    {
++      title: "向歌单新增曲目",
++      description:
++        "把曲目加入歌单，返回前后完整顺序供对账。网易云的新增是逐个插到歌单开头，本工具内部已逆序提交，" +
++        "所以按你期望的最终顺序传 trackIds 即可（[A,B] 结果就是 [A,B]）。只对自建歌单有意义：收藏来的歌单服务端会拒绝",
++      inputSchema: {
++        ...playlistSelector,
++        trackIds: z.array(z.string().trim().min(1)).min(1).max(500),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    async ({ name, id, trackIds }) => {
++      const entry = await resolvePlaylist(id, name);
++      return mutationContent(await addPlaylistTracks(entry, trackIds));
++    },
++  );
++
++  server.registerTool(
++    "remove_playlist_tracks",
++    {
++      title: "从歌单移除曲目",
++      description:
++        "按 id 把曲目移出歌单，返回前后完整顺序供对账。同一首曲目在歌单里多次出现时会被一次性全部移除",
++      inputSchema: {
++        ...playlistSelector,
++        trackIds: z.array(z.string().trim().min(1)).min(1).max(500),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
++    },
++    async ({ name, id, trackIds }) => {
++      const entry = await resolvePlaylist(id, name);
++      return mutationContent(await removePlaylistTracks(entry, trackIds));
++    },
++  );
++
++  server.registerTool(
++    "reorder_playlist",
++    {
++      title: "重排歌单曲序",
++      description:
++        "按传入的完整 id 顺序重排歌单（必须与当前曲目集合完全一致，数量或内容不符直接报错，不会改坏歌单）。" +
++        "本机歌单是原子的；网易云没有曲序接口，实现是「清空后按目标顺序重加」，会刷新全部曲目的加入时间，" +
++        "写后校验不一致会自动回滚并返回 rolledBack。返回 beforeOrder/afterOrder 供对账（顺序错了从不报错，必须对账）",
++      inputSchema: {
++        ...playlistSelector,
++        trackIds: z.array(z.string().trim().min(1)).min(1).max(2000),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
++    },
++    async ({ name, id, trackIds }) => {
++      const entry = await resolvePlaylist(id, name);
++      return mutationContent(await reorderPlaylistTracks(entry, trackIds));
++    },
++  );
++
++  server.registerTool(
++    "move_playlist_track",
++    {
++      title: "移动歌单中的曲目",
++      description:
++        "把一首曲目移到指定位置（toIndex 从 1 开始，与 get_playlist_tracks 返回的 index 一致；越界会夹到两端）。" +
++        "内部按最小位移算出目标顺序后走重排，副作用与 reorder_playlist 相同（网易云会刷新加入时间）",
++      inputSchema: {
++        ...playlistSelector,
++        trackId: z.string().trim().min(1),
++        toIndex: z.number().int().min(1),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
++    },
++    async ({ name, id, trackId, toIndex }) => {
++      const entry = await resolvePlaylist(id, name);
++      return mutationContent(await movePlaylistTrack(entry, trackId, toIndex));
++    },
++  );
++
++  server.registerTool(
++    "create_playlist",
++    {
++      title: "新建歌单",
++      description:
++        "新建歌单，可在建好后按给定顺序写入曲目（顺序语义同 add_playlist_tracks）。" +
++        "source 默认 netease（云端，isPrivate 控制仅自己可见），传 local 则建在本机曲库（只能放本地已有的曲目）",
++      inputSchema: {
++        name: z.string().trim().min(1).max(200),
++        source: z.enum(["netease", "local"]).default("netease"),
++        isPrivate: z.boolean().default(false),
++        trackIds: z.array(z.string().trim().min(1)).max(500).optional(),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    async ({ name, source, isPrivate, trackIds }) =>
++      jsonContent({
++        ok: true,
++        ...(await createPlaylist({ name, source, isPrivate, trackIds: trackIds ?? [] })),
++      }),
++  );
++
++  server.registerTool(
++    "rename_playlist",
++    {
++      title: "重命名歌单",
++      description: "修改歌单名称，本机与网易云自建歌单都支持",
++      inputSchema: { ...playlistSelector, newName: z.string().trim().min(1).max(200) },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
++    },
++    async ({ name, id, newName }) => {
++      const entry = await resolvePlaylist(id, name);
++      await renamePlaylist(entry, newName);
++      return jsonContent({ ok: true, id: entry.id, name: newName, source: entry.source });
++    },
++  );
++
++  server.registerTool(
++    "update_playlist_desc",
++    {
++      title: "修改歌单简介",
++      description:
++        "修改歌单简介，传空串表示清空。本机歌单写入数据库，网易云走 playlist/desc/update",
++      inputSchema: { ...playlistSelector, description: z.string().max(1000) },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
++    },
++    async ({ name, id, description }) => {
++      const entry = await resolvePlaylist(id, name);
++      await updatePlaylistDescription(entry, description);
++      return jsonContent({ ok: true, id: entry.id, source: entry.source });
++    },
++  );
++
++  server.registerTool(
++    "delete_playlist",
++    {
++      title: "删除歌单",
++      description:
++        "删除自建歌单（本机歌单从数据库删除，网易云走 playlist/delete）。id 或 name 必须明确命中一个歌单，" +
++        "删除不可撤销；只是想从「我的歌单」里去掉收藏请用 subscribe_playlist",
++      inputSchema: playlistSelector,
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
++    },
++    async ({ name, id }) => {
++      const entry = await resolvePlaylist(id, name);
++      await deletePlaylist(entry);
++      return jsonContent({ ok: true, deleted: { id: entry.id, name: entry.name } });
++    },
++  );
++
++  server.registerTool(
++    "subscribe_playlist",
++    {
++      title: "收藏或取消收藏歌单",
++      description:
++        "收藏（subscribed=true）或取消收藏（false）网易云歌单，对应 playlist/subscribe 与 unsubscribe。仅网易云歌单可用",
++      inputSchema: { ...playlistSelector, subscribed: z.boolean() },
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
++    },
++    async ({ name, id, subscribed }) => {
++      const entry = await resolvePlaylist(id, name);
++      await setPlaylistSubscribed(entry, subscribed);
++      return jsonContent({ ok: true, id: entry.id, name: entry.name, subscribed });
++    },
++  );
++
+   server.registerTool(
+     "set_play_mode",
+     {
+@@ -198,6 +780,89 @@ const createServer = (): McpServer => {
+     },
+   );
+ 
++  server.registerTool(
++    "remove_from_queue",
++    {
++      title: "从队列移除曲目",
++      description:
++        "按队列下标移除一首曲目。index 与 get_queue 返回的 tracks[].index 同一坐标系（从 0 开始）；" +
++        "移除正在播放的曲目会自动切到下一首",
++      inputSchema: { index: z.number().int().min(0) },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    ({ index }) => {
++      const queue = queueContext(0);
++      if (!queue || index >= queue.total) {
++        throw new Error(`队列下标 ${index} 越界（当前队列 ${queue?.total ?? 0} 首）`);
++      }
++      playerControl.removeFromQueue(index);
++      return jsonContent({ ok: true, index });
++    },
++  );
++
++  server.registerTool(
++    "move_in_queue",
++    {
++      title: "调整队列内曲序",
++      description:
++        "把队列中的曲目从 from 移到 to（下标同 get_queue 的 tracks[].index，从 0 开始）。" +
++        "只影响等待播放的顺序，正在播放的曲目不变（播放下标会自动跟随）",
++      inputSchema: { from: z.number().int().min(0), to: z.number().int().min(0) },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    ({ from, to }) => {
++      const queue = queueContext(0);
++      const total = queue?.total ?? 0;
++      if (from >= total || to >= total) {
++        throw new Error(`队列下标越界（当前队列 ${total} 首，from=${from}, to=${to}）`);
++      }
++      playerControl.moveInQueue(from, to);
++      return jsonContent({ ok: true, from, to });
++    },
++  );
++
++  server.registerTool(
++    "jump_to_index",
++    {
++      title: "跳到队列指定位置播放",
++      description:
++        "播放队列中指定下标的曲目（下标同 get_queue 的 tracks[].index，从 0 开始）。与 next/prev 不同，这是直接定位",
++      inputSchema: { index: z.number().int().min(0) },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    async ({ index }) => {
++      const queue = queueContext(QUEUE_WINDOW_RADIUS);
++      if (!queue || index >= queue.total) {
++        throw new Error(`队列下标 ${index} 越界（当前队列 ${queue?.total ?? 0} 首）`);
++      }
++      playerControl.jumpToIndex(index);
++      const target = queue.tracks.find((track) => track.index === index);
++      const matched = target ? await waitForTrackSwitch(target.id) : false;
++      return jsonContent({
++        ok: true,
++        index,
++        ...(target ? { trackId: target.id, title: target.title } : {}),
++        ...(target && !matched
++          ? { note: `切歌后 ${TRACK_SWITCH_WAIT_MS}ms 内未观测到目标曲目开始播放，可能音源受限` }
++          : {}),
++      });
++    },
++  );
++
++  server.registerTool(
++    "clear_queue",
++    {
++      title: "清空播放队列",
++      description:
++        "停止播放并清空整个播放队列（与界面里的「清空队列」一致，相当于队列面板的清空按钮）",
++      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
++    },
++    () => {
++      playerControl.clearQueue();
++      return jsonContent({ ok: true });
++    },
++  );
++
+   server.registerTool(
+     "search_library",
+     {
+@@ -286,6 +951,74 @@ const createServer = (): McpServer => {
+     },
+   );
+ 
++  server.registerTool(
++    "toggle_like",
++    {
++      title: "喜欢/取消喜欢当前歌曲",
++      description:
++        "对当前播放的歌曲切换「喜欢」状态并写入网易云账号。需要先有正在播放的曲目；" +
++        "喜欢状态写入是异步的，返回值只表示指令已下发，可用 list_liked 复核",
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
++    },
++    () => {
++      const track = nowPlaying.lightSnapshot().track;
++      if (!track) throw new Error("当前没有播放中的曲目");
++      playerControl.toggleLike();
++      return jsonContent({ ok: true, trackId: track.id, title: track.title });
++    },
++  );
++
++  server.registerTool(
++    "list_liked",
++    {
++      title: "读取「喜欢的音乐」",
++      description:
++        "分页读取网易云账号「喜欢的音乐」，返回总数、本页歌曲 id 与曲目详情（可直接把 id 传给 play_track / add_to_queue）",
++      inputSchema: {
++        offset: z.number().int().min(0).default(0),
++        limit: z.number().int().min(1).max(200).default(50),
++      },
++      annotations: { readOnlyHint: true, idempotentHint: true },
++    },
++    async ({ offset, limit }) => {
++      const result = await listLikedTracks(offset, limit);
++      return jsonContent({
++        total: result.total,
++        offset: result.offset,
++        limit: result.limit,
++        ids: result.ids,
++        tracks: result.tracks.map(toTrackSummary),
++      });
++    },
++  );
++
++  server.registerTool(
++    "set_lyric_offset",
++    {
++      title: "设置歌词偏移",
++      description:
++        "给当前曲目（或用 trackId 指定的曲目）设置歌词偏移，单位毫秒，正值为歌词提前，最大 ±60000，传 0 清除。" +
++        "偏移按「曲目 + 歌词源」持久化，切歌后仍生效；不传 trackId 时作用于当前播放曲目",
++      inputSchema: {
++        offsetMs: z.number().int().min(-60000).max(60000),
++        trackId: z.string().trim().min(1).optional(),
++      },
++      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
++    },
++    ({ offsetMs, trackId }) => {
++      const currentId = nowPlaying.lightSnapshot().track?.id;
++      const targetId = trackId ?? currentId;
++      if (!targetId) throw new Error("当前没有播放中的曲目，请显式传入 trackId");
++      nowPlaying.setLyricOffset(targetId, offsetMs);
++      return jsonContent({
++        ok: true,
++        trackId: targetId,
++        offsetMs,
++        appliesToCurrentTrack: targetId === currentId,
++      });
++    },
++  );
++
+   server.registerResource(
+     "now-playing",
+     "splayer://now-playing",
+@@ -328,6 +1061,52 @@ const createServer = (): McpServer => {
+     }),
+   );
+ 
++  server.registerResource(
++    "lyrics-current",
++    "splayer://lyrics/current",
++    {
++      title: "SPlayer 当前歌词窗口",
++      description: "当前播放位置附近的歌词行（含翻译与音译），默认上下各 3 行",
++      mimeType: "application/json",
++    },
++    (uri) => ({
++      contents: [
++        {
++          uri: uri.href,
++          mimeType: "application/json",
++          text: JSON.stringify(lyricWindow(3)),
++        },
++      ],
++    }),
++  );
++
++  server.registerResource(
++    "queue-window",
++    "splayer://queue",
++    {
++      title: "SPlayer 播放队列窗口",
++      description: `当前下标、总长与前后各最多 ${QUEUE_WINDOW_RADIUS} 首`,
++      mimeType: "application/json",
++    },
++    (uri) => {
++      const queue = queueContext(QUEUE_WINDOW_RADIUS);
++      const playMode = getTrayPlayMode();
++      return {
++        contents: [
++          {
++            uri: uri.href,
++            mimeType: "application/json",
++            text: JSON.stringify({
++              ...(queue ?? { index: -1, total: 0, tracks: [] }),
++              repeat: playMode.repeat,
++              shuffle: playMode.shuffle,
++            }),
++          },
++        ],
++      };
++    },
++  );
++
+   return server;
+ };
+ 
+diff --git a/electron/main/services/nowPlaying.ts b/electron/main/services/nowPlaying.ts
+index f035ee2..d4aa82d 100644
+--- a/electron/main/services/nowPlaying.ts
++++ b/electron/main/services/nowPlaying.ts
+@@ -5,6 +5,7 @@ import type {
+   NowPlayingSnapshot,
+   NowPlayingPositionSync,
+   NowPlayingLyricOffsetSync,
++  NowPlayingQueueSnapshot,
+ } from "@shared/types/nowPlaying";
+ import { store } from "@main/store";
+ 
+@@ -25,6 +26,8 @@ let currentTrack: Track | null = null;
+ let currentLyric: LyricLine[] = [];
+ /** 当前激活的歌词源 */
+ let currentSource: LyricData = null;
++/** 最近一次由渲染进程同步的播放队列窗口 */
++let currentQueue: NowPlayingQueueSnapshot | null = null;
+ /** 最近一次播放位置（毫秒） */
+ let lastPosition = 0;
+ /** lastPosition 真实成立的墙钟时刻（Date.now 毫秒），用于补偿其过期时长 */
+@@ -239,6 +242,17 @@ export const lyricSnapshot = () => ({
+   lyricOffsetMs: currentLyricOffsetMs,
+ });
+ 
++/**
++ * 接收渲染进程同步的播放队列窗口
++ * @param payload - 以当前曲目为中心的队列窗口快照
++ */
++export const updateQueue = (payload: NowPlayingQueueSnapshot): void => {
++  currentQueue = payload;
++};
++
++/** 获取播放队列窗口；渲染进程尚未同步时为 null */
++export const queueSnapshot = (): NowPlayingQueueSnapshot | null => currentQueue;
++
+ /** 清空 */
+ export const clear = (): void => {
+   pendingTransition = null;
+diff --git a/electron/main/store/migrations.ts b/electron/main/store/migrations.ts
+index 350933e..4410f1e 100644
+--- a/electron/main/store/migrations.ts
++++ b/electron/main/store/migrations.ts
+@@ -1,4 +1,4 @@
+-import type { SystemConfig } from "@shared/types/settings";
++import type { McpSettings, SystemConfig } from "@shared/types/settings";
+ 
+ export interface Migration {
+   /** 版本号，递增整数 */
+@@ -12,11 +12,13 @@ export interface Migration {
+  * 新增字段已由 deepMerge 自动补全，此处仅用于字段重命名、数据转换等
+  */
+ export const migrations: Migration[] = [
+-  // 示例：
+-  // {
+-  //   version: 1,
+-  //   migrate: (data) => {
+-  //     // 重命名字段、转换数据格式等
+-  //   },
+-  // },
++  {
++    // MCP 的「允许局域网访问」开关改为「监听范围」三选一，原先开启过的迁移为 lan
++    version: 1,
++    migrate: (data) => {
++      const mcp = data.mcp as McpSettings & { allowLan?: boolean };
++      if (mcp.allowLan === true) mcp.bindMode = "lan";
++      delete mcp.allowLan;
++    },
++  },
+ ];
+diff --git a/electron/main/utils/lan.spec.ts b/electron/main/utils/lan.spec.ts
+new file mode 100644
+index 0000000..cf91ad5
+--- /dev/null
++++ b/electron/main/utils/lan.spec.ts
+@@ -0,0 +1,49 @@
++import { describe, expect, it } from "vitest";
++import type { NetworkInterfaceInfo } from "node:os";
++import { pickWslAddresses } from "./lan";
++
++const iface = (address: string, family: "IPv4" | "IPv6" = "IPv4"): NetworkInterfaceInfo =>
++  family === "IPv4"
++    ? {
++        address,
++        netmask: "255.255.240.0",
++        family,
++        mac: "00:00:00:00:00:00",
++        internal: false,
++        cidr: `${address}/20`,
++        scopeid: 0,
++      }
++    : {
++        address,
++        netmask: "ffff:ffff:ffff:ffff::",
++        family,
++        mac: "00:00:00:00:00:00",
++        internal: false,
++        cidr: `${address}/64`,
++        scopeid: 0,
++      };
++
++describe("WSL 虚拟网卡地址筛选", () => {
++  it("只取 WSL / Hyper-V 虚拟网卡的地址，忽略物理网卡与热点", () => {
++    expect(
++      pickWslAddresses({
++        "vEthernet (WSL (Hyper-V firewall))": [iface("192.168.192.1")],
++        "WLAN 2": [iface("172.23.101.215")],
++        "本地连接* 2": [iface("192.168.137.1")],
++      }),
++    ).toEqual(["192.168.192.1"]);
++  });
++
++  it("过滤 IPv6 与内部地址，并对重复地址去重", () => {
++    expect(
++      pickWslAddresses({
++        "vEthernet (WSL)": [iface("192.168.192.1"), iface("fe80::1", "IPv6")],
++        "vEthernet (WSL (Hyper-V firewall))": [iface("192.168.192.1")],
++      }),
++    ).toEqual(["192.168.192.1"]);
++  });
++
++  it("没有虚拟网卡时返回空数组", () => {
++    expect(pickWslAddresses({ eth0: [iface("192.168.205.92")] })).toEqual([]);
++  });
++});
+diff --git a/electron/main/utils/lan.ts b/electron/main/utils/lan.ts
+new file mode 100644
+index 0000000..16aea7f
+--- /dev/null
++++ b/electron/main/utils/lan.ts
+@@ -0,0 +1,43 @@
++import os from "node:os";
++
++/**
++ * 取局域网展示地址，绑定 0.0.0.0 时作为展示给用户的局域网入口
++ * 优先常见家用/企业网段：WSL2/Hyper-V 的虚拟交换机常占用 172.x 且排在物理网卡前
++ */
++export const getLanAddress = (): string | null => {
++  const candidates: string[] = [];
++  for (const list of Object.values(os.networkInterfaces())) {
++    for (const item of list ?? []) {
++      if (item.family === "IPv4" && !item.internal) candidates.push(item.address);
++    }
++  }
++  return (
++    candidates.find((address) => address.startsWith("192.168.")) ??
++    candidates.find((address) => address.startsWith("10.")) ??
++    candidates[0] ??
++    null
++  );
++};
++
++/** WSL / Hyper-V 虚拟网卡名匹配；Windows 上形如 `vEthernet (WSL (Hyper-V firewall))` */
++const WSL_INTERFACE_RE = /wsl|hyper-v/i;
++
++/**
++ * 从网卡列表挑出 WSL / Hyper-V 虚拟网卡的 IPv4 地址
++ * 这些地址只对 WSL 侧的 Agent 可达，绑定它们即可让 WSL 直连而不把端口暴露给局域网
++ * @param interfaces - 网卡列表，形如 os.networkInterfaces() 的返回值
++ * @returns 去重后的地址列表；没有匹配网卡时为空数组
++ */
++export const pickWslAddresses = (interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]>): string[] => {
++  const addresses = new Set<string>();
++  for (const [name, list] of Object.entries(interfaces)) {
++    if (!WSL_INTERFACE_RE.test(name)) continue;
++    for (const item of list ?? []) {
++      if (item.family === "IPv4" && !item.internal) addresses.add(item.address);
++    }
++  }
++  return [...addresses];
++};
++
++/** 取本机 WSL / Hyper-V 虚拟网卡地址；非 Windows 或 WSL 未启用时为空数组 */
++export const getWslAddresses = (): string[] => pickWslAddresses(os.networkInterfaces());
+diff --git a/electron/preload/index.ts b/electron/preload/index.ts
+index ebd3c97..18035ef 100644
+--- a/electron/preload/index.ts
++++ b/electron/preload/index.ts
+@@ -515,6 +515,8 @@ const api = {
+   nowPlaying: {
+     // 渲染进程同步当前播放状态到主进程
+     update: (payload: unknown) => ipcRenderer.send("nowPlaying:update", payload),
++    // 渲染进程同步播放队列窗口到主进程
++    updateQueue: (payload: unknown) => ipcRenderer.send("nowPlaying:updateQueue", payload),
+     // 拉取当前完整快照
+     requestSnapshot: () => ipcRenderer.invoke("nowPlaying:requestSnapshot"),
+     // 写入指定曲目的歌词偏移（ms），0 视为清除
+diff --git a/src/components/settings/custom/McpConfigDialog.vue b/src/components/settings/custom/McpConfigDialog.vue
+index a9b6c46..380d20d 100644
+--- a/src/components/settings/custom/McpConfigDialog.vue
++++ b/src/components/settings/custom/McpConfigDialog.vue
+@@ -14,6 +14,7 @@ const open = ref(false);
+ const opening = ref(false);
+ const params = ref<McpClientConfigParams>({
+   port: settings.system.mcp.port,
++  host: "127.0.0.1",
+   accessKey: "********************************",
+ });
+ const agents = ref<McpAgentApp[]>([]);
+@@ -25,7 +26,7 @@ const clientConfig = computed(() =>
+       mcpServers: {
+         "splayer-next": {
+           type: "http",
+-          url: `http://127.0.0.1:${params.value.port}/mcp`,
++          url: `http://${params.value.host}:${params.value.port}/mcp`,
+           headers: { "X-MCP-Key": params.value.accessKey },
+         },
+       },
+@@ -55,7 +56,7 @@ const handleOpen = async (): Promise<void> => {
+ };
+ 
+ const handleInject = async (agent: McpAgentApp) => {
+-  if (agent.configured || !agent.injectable) return;
++  if (!agent.injectable) return;
+   injecting.value[agent.id] = true;
+   try {
+     await window.api.mcp.injectAgentConfig(agent.id, toRaw(params.value));
+@@ -106,12 +107,15 @@ const handleInject = async (agent: McpAgentApp) => {
+             <span class="text-xs text-on-surface-variant/70 truncate" :title="agent.configPath">
+               {{ agent.configPath }}
+             </span>
++            <span v-if="agent.hintKey" class="text-xs text-amber-500 truncate">
++              {{ t(agent.hintKey) }}
++            </span>
+           </div>
+           <SButton
+             size="small"
+             variant="secondary"
+             :type="agent.configured ? 'default' : 'primary'"
+-            :disabled="agent.configured || !agent.injectable"
++            :disabled="!agent.injectable"
+             :loading="injecting[agent.id]"
+             @click="handleInject(agent)"
+           >
+@@ -119,7 +123,7 @@ const handleInject = async (agent: McpAgentApp) => {
+               !agent.injectable
+                 ? t("settings.mcp.notSupported")
+                 : agent.configured
+-                  ? t("settings.mcp.injected")
++                  ? t("settings.mcp.reconfigure")
+                   : t("settings.mcp.inject")
+             }}
+           </SButton>
+diff --git a/src/components/settings/custom/McpStatusCard.vue b/src/components/settings/custom/McpStatusCard.vue
+index a93f6c9..8ae10ae 100644
+--- a/src/components/settings/custom/McpStatusCard.vue
++++ b/src/components/settings/custom/McpStatusCard.vue
+@@ -10,13 +10,31 @@ defineOptions({ inheritAttrs: false });
+ const { t } = useI18n();
+ const { copy } = useCopyText();
+ const settings = useSettingsStore();
+-const status = ref<McpStatus>({ listening: false, port: null, error: null });
++const status = ref<McpStatus>({
++  listening: false,
++  bindMode: "loopback",
++  host: null,
++  port: null,
++  error: null,
++});
+ const restarting = ref(false);
+ 
+ const address = computed(
+-  () => `http://127.0.0.1:${status.value.port ?? settings.system.mcp.port}/mcp`,
++  () =>
++    `http://${status.value.host ?? "127.0.0.1"}:${status.value.port ?? settings.system.mcp.port}/mcp`,
++);
++
++/** 监听范围或端口已改但服务仍是旧配置时提示需要重启 */
++const restartPending = computed(
++  () =>
++    status.value.listening &&
++    (status.value.bindMode !== settings.system.mcp.bindMode ||
++      status.value.port !== settings.system.mcp.port),
+ );
+ 
++/** 当前实际生效的监听范围文案 */
++const runningBindMode = computed(() => t(`settings.mcpBindMode.${status.value.bindMode}`));
++
+ const restart = async (): Promise<void> => {
+   if (!settings.system.mcp.enabled || restarting.value) return;
+   restarting.value = true;
+@@ -58,6 +76,9 @@ onBeforeUnmount(() => unsubscribe?.());
+     <span class="shrink-0 text-sm text-on-surface-variant">
+       {{ status.listening ? t("settings.mcp.running") : t("settings.mcp.stopped") }}
+     </span>
++    <span v-if="restartPending" class="shrink-0 text-xs text-amber-500">
++      {{ t("settings.mcp.pendingRestart", { mode: runningBindMode }) }}
++    </span>
+     <div
+       class="min-w-0 flex-1 truncate rounded-lg bg-on-surface/5 px-3 py-2 text-sm text-on-surface-variant tabular-nums"
+     >
+diff --git a/src/main.ts b/src/main.ts
+index b67f33f..2ed2b08 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -11,6 +11,7 @@ import { useSettingsStore } from "./stores/settings";
+ import { useHotkeyStore } from "./stores/hotkey";
+ import { initPlayer, playFiles, restoreLastTrack } from "./core/player";
+ import { handleOrpheus } from "./services/orpheus";
++import { startQueueSync } from "./services/queueSync";
+ import { installHotkeyManager } from "./core/hotkey/manager";
+ import { vRipple } from "./directives/ripple";
+ 
+@@ -79,6 +80,8 @@ const bootstrapPlayback = async (): Promise<void> => {
+ router.isReady().then(async () => {
+   // 挂载应用
+   app.mount("#app");
++  // 同步播放队列窗口到主进程（供 MCP 读取播放上下文）
++  startQueueSync();
+   // 启动播放服务
+   void bootstrapPlayback().catch(console.error);
+   // 淡出加载动画
+diff --git a/src/services/queueSync.ts b/src/services/queueSync.ts
+new file mode 100644
+index 0000000..9e6e587
+--- /dev/null
++++ b/src/services/queueSync.ts
+@@ -0,0 +1,49 @@
++import { watch } from "vue";
++import { QUEUE_WINDOW_RADIUS, type NowPlayingQueueSnapshot } from "@shared/types/nowPlaying";
++import { queueEntries } from "@/stores/queue";
++import { useStatusStore } from "@/stores/status";
++
++/** 队列窗口推送的去抖间隔（毫秒）：一次操作可能连续改动队列与索引 */
++const SYNC_DEBOUNCE_MS = 200;
++
++/**
++ * 构造以当前曲目为中心的队列窗口
++ * @param index - 当前播放索引
++ * @returns 队列窗口快照
++ */
++const buildQueueSnapshot = (index: number): NowPlayingQueueSnapshot => {
++  const entries = queueEntries.value;
++  const start = Math.max(0, index - QUEUE_WINDOW_RADIUS);
++  const end = Math.min(entries.length, index + QUEUE_WINDOW_RADIUS + 1);
++  return {
++    index,
++    total: entries.length,
++    startIndex: start,
++    tracks: entries.slice(start, end).map(({ track }) => ({
++      id: track.id,
++      title: track.title,
++      artists: track.artists.map((artist) => artist.name),
++      durationMs: track.duration,
++    })),
++  };
++};
++
++/**
++ * 把播放队列窗口同步到主进程，供 MCP / 外部客户端读取当前播放上下文
++ * 窗口只含当前曲目前后有限首，避免整条队列经 IPC 反复传输
++ */
++export const startQueueSync = (): void => {
++  const status = useStatusStore();
++  let timer: ReturnType<typeof setTimeout> | null = null;
++  watch(
++    [queueEntries, () => status.playIndex],
++    () => {
++      if (timer) clearTimeout(timer);
++      timer = setTimeout(() => {
++        timer = null;
++        window.api.nowPlaying.updateQueue(buildQueueSnapshot(status.playIndex));
++      }, SYNC_DEBOUNCE_MS);
++    },
++    { immediate: true },
++  );
++};

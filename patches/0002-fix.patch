@@ -1,0 +1,154 @@
+From 376fcf6737798f06290143b8c37c09fd52f4bccf Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:47 +0800
+Subject: [PATCH 2/8] =?UTF-8?q?fix:=20=E4=BF=AE=E5=A4=8D=E6=95=B4=E8=A1=8C?=
+ =?UTF-8?q?=E5=8D=95=E8=AF=8D=E6=97=B6=E6=AD=8C=E8=AF=8D=E7=BD=97=E9=A9=AC?=
+ =?UTF-8?q?=E9=9F=B3=E9=87=8D=E5=A4=8D=E4=B8=94=E6=BA=A2=E5=87=BA=E7=9A=84?=
+ =?UTF-8?q?=E9=97=AE=E9=A2=98?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ src/stores/media.ts               |  3 ++
+ src/utils/lyric/wordRoman.spec.ts | 72 +++++++++++++++++++++++++++++++
+ src/utils/lyric/wordRoman.ts      | 30 +++++++++++++
+ 3 files changed, 105 insertions(+)
+ create mode 100644 src/utils/lyric/wordRoman.spec.ts
+ create mode 100644 src/utils/lyric/wordRoman.ts
+
+diff --git a/src/stores/media.ts b/src/stores/media.ts
+index bd64145..ec21345 100644
+--- a/src/stores/media.ts
++++ b/src/stores/media.ts
+@@ -11,6 +11,7 @@ import {
+ } from "lyric-kit";
+ import { applyLyricExclude } from "@/utils/lyric/lyricStripper";
+ import { applyLyricCjkTransform } from "@/utils/lyric/cjkTransform";
++import { dropDuplicatedWordRoman } from "@/utils/lyric/wordRoman";
+ 
+ export const useMediaStore = defineStore("media", () => {
+   watchLyricPreference();
+@@ -175,6 +176,8 @@ export const useMediaStore = defineStore("media", () => {
+         );
+         nextLines = applyLyricExclude(result.lines, track.value);
+         normalizeLyricLines(nextLines);
++        // 整行当一个词时，词级罗马音会被复制到拆出的每一段，这里回退为行级罗马音
++        dropDuplicatedWordRoman(nextLines);
+         applyLyricLanguages(nextLines);
+         authors = result.metadata.authors?.length
+           ? result.metadata.authors
+diff --git a/src/utils/lyric/wordRoman.spec.ts b/src/utils/lyric/wordRoman.spec.ts
+new file mode 100644
+index 0000000..5fa2641
+--- /dev/null
++++ b/src/utils/lyric/wordRoman.spec.ts
+@@ -0,0 +1,72 @@
++import { describe, expect, it } from "vitest";
++import type { LyricLine } from "@shared/types/lyrics";
++import { dropDuplicatedWordRoman } from "./wordRoman";
++
++const line = (words: { word: string; romanWord?: string }[], romanLyric?: string): LyricLine =>
++  ({
++    startTime: 0,
++    endTime: 1000,
++    words: words.map((word, index) => ({
++      word: word.word,
++      romanWord: word.romanWord,
++      startTime: index * 100,
++      endTime: index * 100 + 100,
++    })),
++    romanLyric,
++  }) as unknown as LyricLine;
++
++describe("重复罗马音归一化", () => {
++  it("整行当一词、词内含空白且罗马音等于行级时，清掉词级罗马音", () => {
++    const roman = "shi ra na i se i ka tsu wo so u zo u shi te";
++    const lines = [line([{ word: "知らない生活を想像して だけど君", romanWord: roman }], roman)];
++
++    dropDuplicatedWordRoman(lines);
++
++    expect(lines[0].words[0].romanWord).toBeUndefined();
++    expect(lines[0].romanLyric).toBe(roman);
++  });
++
++  it("多个词各自携带整行罗马音时同样清理", () => {
++    const roman = "a b c d";
++    const lines = [
++      line(
++        [
++          { word: "前半 部分", romanWord: roman },
++          { word: "後半 部分", romanWord: roman },
++        ],
++        roman,
++      ),
++    ];
++
++    dropDuplicatedWordRoman(lines);
++
++    expect(lines[0].words.every((word) => word.romanWord === undefined)).toBe(true);
++  });
++
++  it("逐词罗马音正常时不改动", () => {
++    const lines = [
++      line(
++        [
++          { word: "ずっと", romanWord: "zu tto" },
++          { word: "君と", romanWord: "ki mi to" },
++        ],
++        "zu tto ki mi to",
++      ),
++    ];
++
++    dropDuplicatedWordRoman(lines);
++
++    expect(lines[0].words.map((word) => word.romanWord)).toEqual(["zu tto", "ki mi to"]);
++  });
++
++  it("没有行级罗马音或词内无空白时不改动", () => {
++    const noLineRoman = [line([{ word: "知らない生活 だけど", romanWord: "shi ra na i" }])];
++    const noSpace = [line([{ word: "さよなら", romanWord: "sa yo na ra" }], "sa yo na ra")];
++
++    dropDuplicatedWordRoman(noLineRoman);
++    dropDuplicatedWordRoman(noSpace);
++
++    expect(noLineRoman[0].words[0].romanWord).toBe("shi ra na i");
++    expect(noSpace[0].words[0].romanWord).toBe("sa yo na ra");
++  });
++});
+diff --git a/src/utils/lyric/wordRoman.ts b/src/utils/lyric/wordRoman.ts
+new file mode 100644
+index 0000000..ecb3999
+--- /dev/null
++++ b/src/utils/lyric/wordRoman.ts
+@@ -0,0 +1,30 @@
++import type { LyricLine } from "@shared/types/lyrics";
++
++/**
++ * 归一化"整行被当成一个词"时被复制到每个片段的重复罗马音
++ *
++ * 背景：某些来源（如「主歌词 LRC + 行级音译 LRC」）解析后会得到"一行一个词、词内含空格、
++ * 词的 romanWord 等于整行 romanLyric"的结构。渲染引擎（lyric-dom 的
++ * `chunkAndSplitLyricWords`）会为了断行按空白把词拆成多段，但**不会同步拆分 romanWord**，
++ * 于是每一段都挂上整行罗马音：视觉上罗马音重复出现，且因逐词罗马音是 `nowrap` 而溢出歌词栏。
++ *
++ * 处理方式：识别这种退化行（所有词的 romanWord 都等于行级 romanLyric，且词内含空白），
++ * 去掉词级 romanWord。渲染引擎随即回退到行级罗马音（`.lp-sub`）：只渲染一次、可自动换行，
++ * 同时该行走 `isStatic` 简化路径，文本也能自然断行。
++ *
++ * 逐词罗马音正常（如 TTML/QRC 提供的分词音译）的行不受影响。
++ * @param lines - 解析后的歌词行，就地修改
++ */
++export const dropDuplicatedWordRoman = (lines: LyricLine[]): void => {
++  for (const line of lines) {
++    const lineRoman = line.romanLyric?.trim();
++    if (!lineRoman) continue;
++    const words = line.words ?? [];
++    if (words.length === 0) continue;
++    // 只有会被渲染层按空白拆分的词才需要处理
++    if (!words.some((word) => /\s/.test(word.word))) continue;
++    // 仅当每个词携带的都是整行罗马音时才判定为退化数据
++    if (!words.every((word) => (word.romanWord?.trim() ?? "") === lineRoman)) continue;
++    for (const word of words) delete word.romanWord;
++  }
++};

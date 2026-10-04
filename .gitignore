@@ -1,0 +1,25 @@
+# 构建产物与依赖
+node_modules/
+dist/
+out/
+*.exe
+*.node
+*.asar
+
+# 日志与临时文件
+*.log
+*.tmp
+.patchbuild/
+.patchverify/
+
+# 环境/凭据（本仓库不应包含任何凭据）
+.env
+.env.*
+*settings.json
+*credentials*
+*.pem
+*.key
+
+# 系统文件
+.DS_Store
+Thumbs.db

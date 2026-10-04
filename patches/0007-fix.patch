@@ -1,0 +1,211 @@
+From 2bd52f78833cdf26c3f2e29f50e77b4126c4dce4 Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 17:35:48 +0800
+Subject: [PATCH 7/8] =?UTF-8?q?fix:=20=E8=B4=A6=E5=8F=B7=E4=BC=9A=E8=AF=9D?=
+ =?UTF-8?q?=E5=8A=A0=E5=AF=86=E5=AD=98=E5=82=A8=E5=B9=B6=E8=BF=81=E7=A7=BB?=
+ =?UTF-8?q?=E5=8E=86=E5=8F=B2=E6=98=8E=E6=96=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ electron/main/database/sessions.spec.ts | 89 +++++++++++++++++++++++++
+ electron/main/database/sessions.ts      | 67 +++++++++++++++++--
+ 2 files changed, 150 insertions(+), 6 deletions(-)
+ create mode 100644 electron/main/database/sessions.spec.ts
+
+diff --git a/electron/main/database/sessions.spec.ts b/electron/main/database/sessions.spec.ts
+new file mode 100644
+index 0000000..c99f120
+--- /dev/null
++++ b/electron/main/database/sessions.spec.ts
+@@ -0,0 +1,89 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({
++  rows: new Map<string, string>(),
++  encryptionAvailable: true,
++  warn: vi.fn(),
++  info: vi.fn(),
++}));
++
++vi.mock("electron", () => ({
++  safeStorage: {
++    isEncryptionAvailable: () => mocks.encryptionAvailable,
++    // 用可逆的假实现替代系统安全存储，便于断言前缀与往返
++    encryptString: (plain: string) => Buffer.from(`fake:${plain}`, "utf-8"),
++    decryptString: (buffer: Buffer) => {
++      const text = buffer.toString("utf-8");
++      if (!text.startsWith("fake:")) throw new Error("bad ciphertext");
++      return text.slice("fake:".length);
++    },
++  },
++}));
++
++vi.mock("./index", () => ({
++  getDb: () => ({
++    prepare: () => ({
++      get: (platform: string) =>
++        mocks.rows.has(platform) ? { cookies: mocks.rows.get(platform) } : undefined,
++      run: (platform: string, cookies: string) => {
++        mocks.rows.set(platform, cookies);
++      },
++    }),
++  }),
++}));
++
++vi.mock("@main/utils/logger", () => ({
++  libraryLog: { warn: mocks.warn, info: mocks.info },
++}));
++
++import { clearSessionCookies, getSessionCookies, saveSessionCookies } from "./sessions";
++
++describe("第三方账号会话存储", () => {
++  beforeEach(() => {
++    mocks.rows.clear();
++    mocks.encryptionAvailable = true;
++    mocks.warn.mockClear();
++    mocks.info.mockClear();
++  });
++
++  it("写入时加密，读取时还原", () => {
++    saveSessionCookies("netease", { MUSIC_U: "token", __csrf: "csrf" });
++
++    expect(mocks.rows.get("netease")?.startsWith("enc:")).toBe(true);
++    expect(mocks.rows.get("netease")).not.toContain("token");
++    expect(getSessionCookies("netease")).toEqual({ MUSIC_U: "token", __csrf: "csrf" });
++    expect(mocks.warn).not.toHaveBeenCalled();
++  });
++
++  it("旧版明文 JSON 首次读取即迁移为加密存储", () => {
++    mocks.rows.set("netease", JSON.stringify({ MUSIC_U: "legacy" }));
++
++    expect(getSessionCookies("netease")).toEqual({ MUSIC_U: "legacy" });
++    expect(mocks.rows.get("netease")?.startsWith("enc:")).toBe(true);
++    expect(mocks.info).toHaveBeenCalledTimes(1);
++  });
++
++  it("安全存储不可用时退化为 base64 明文并告警", () => {
++    mocks.encryptionAvailable = false;
++
++    saveSessionCookies("netease", { MUSIC_U: "plain" });
++
++    expect(mocks.rows.get("netease")?.startsWith("b64:")).toBe(true);
++    expect(mocks.warn).toHaveBeenCalledTimes(1);
++    expect(getSessionCookies("netease")).toEqual({ MUSIC_U: "plain" });
++  });
++
++  it("密文损坏或旧数据非法时按未登录处理", () => {
++    mocks.rows.set("netease", "enc:bm90LWEtY2lwaGVy");
++
++    expect(getSessionCookies("netease")).toEqual({});
++    expect(getSessionCookies("qqmusic")).toEqual({});
++  });
++
++  it("登出写入空对象", () => {
++    saveSessionCookies("netease", { MUSIC_U: "token" });
++    clearSessionCookies("netease");
++
++    expect(getSessionCookies("netease")).toEqual({});
++  });
++});
+diff --git a/electron/main/database/sessions.ts b/electron/main/database/sessions.ts
+index 2df0bfc..517cdd8 100644
+--- a/electron/main/database/sessions.ts
++++ b/electron/main/database/sessions.ts
+@@ -1,10 +1,13 @@
+ /**
+  * 第三方音源账号会话（cookies）存储
+  *
+- * 表：account_sessions(platform PK, cookies JSON, updated_at)
+- * - cookies 字段以 JSON 字符串存 Record<string, string>
++ * 表：account_sessions(platform PK, cookies TEXT, updated_at)
++ * - cookies 字段以 safeStorage 加密后 base64 存储；安全存储不可用时退化为 base64 明文
++ * - 旧版本写入的明文 JSON 会在首次读取时自动迁移为当前编码
+  */
+ 
++import { safeStorage } from "electron";
++import { libraryLog } from "@main/utils/logger";
+ import { getDb } from "./index";
+ import type { Platform } from "@shared/types/platform";
+ 
+@@ -14,15 +17,67 @@ interface SessionRow {
+   updated_at: number;
+ }
+ 
+-/** 读取某平台的 cookies；未登录返回空对象 */
++/** safeStorage 密文前缀 */
++const ENC_PREFIX = "enc:";
++/** 安全存储不可用时的 base64 明文前缀 */
++const B64_PREFIX = "b64:";
++
++/**
++ * 编码会话 JSON
++ * @param json - 会话 cookies 的 JSON 字符串
++ * @returns 带前缀的存储值
++ */
++const encodeCookies = (json: string): string => {
++  if (safeStorage.isEncryptionAvailable()) {
++    return `${ENC_PREFIX}${safeStorage.encryptString(json).toString("base64")}`;
++  }
++  libraryLog.warn("系统安全存储不可用，第三方账号会话将以 base64 明文落盘");
++  return `${B64_PREFIX}${Buffer.from(json, "utf-8").toString("base64")}`;
++};
++
++/**
++ * 解码会话 JSON
++ * @param stored - 数据库中的存储值
++ * @returns 解出的 JSON 字符串；旧版明文或无前缀数据返回 null（交由调用方迁移）
++ */
++const decodeCookies = (stored: string): string | null => {
++  try {
++    if (stored.startsWith(ENC_PREFIX)) {
++      if (!safeStorage.isEncryptionAvailable()) return null;
++      return safeStorage.decryptString(Buffer.from(stored.slice(ENC_PREFIX.length), "base64"));
++    }
++    if (stored.startsWith(B64_PREFIX)) {
++      return Buffer.from(stored.slice(B64_PREFIX.length), "base64").toString("utf-8");
++    }
++  } catch (error) {
++    libraryLog.warn(`第三方账号会话解密失败：${error instanceof Error ? error.message : error}`);
++  }
++  return null;
++};
++
++/** 读取某平台的 cookies；未登录或数据损坏返回空对象 */
+ export const getSessionCookies = (platform: Platform): Record<string, string> => {
+   const row = getDb()
+     .prepare("SELECT cookies FROM account_sessions WHERE platform = ?")
+     .get(platform) as Pick<SessionRow, "cookies"> | undefined;
+   if (!row) return {};
++
++  const decoded = decodeCookies(row.cookies);
++  if (decoded !== null) {
++    try {
++      return (JSON.parse(decoded) as Record<string, string>) ?? {};
++    } catch {
++      return {};
++    }
++  }
++
++  // 旧版本写入的明文 JSON：解析成功后按当前编码重写，迁移只发生一次
+   try {
+-    const parsed = JSON.parse(row.cookies) as Record<string, string>;
+-    return parsed ?? {};
++    const legacy = JSON.parse(row.cookies) as Record<string, string>;
++    if (!legacy || typeof legacy !== "object") return {};
++    saveSessionCookies(platform, legacy);
++    libraryLog.info(`第三方账号会话已迁移为加密存储：${platform}`);
++    return legacy;
+   } catch {
+     return {};
+   }
+@@ -37,7 +92,7 @@ export const saveSessionCookies = (platform: Platform, cookies: Record<string, s
+          cookies = excluded.cookies,
+          updated_at = excluded.updated_at`,
+     )
+-    .run(platform, JSON.stringify(cookies), Date.now());
++    .run(platform, encodeCookies(JSON.stringify(cookies)), Date.now());
+ };
+ 
+ /** 清除某平台的 cookies（登出） */

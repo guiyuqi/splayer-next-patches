@@ -1,0 +1,43 @@
+SPlayer-Next 非官方修改版补丁集 —— 修改与第三方声明
+=====================================================
+
+一、本仓库是什么
+本仓库**只包含补丁文件**，不包含 SPlayer-Next 的完整源码，也不包含任何编译产物或二进制。
+补丁的作用对象是 SPlayer-Next（https://github.com/SPlayer-Dev/SPlayer-Next）`dev` 分支的
+提交 4c60335。仓库内容：patches/、CHANGES.md、docs/、tools/、scripts/、README.md、LICENSE。
+
+二、修改声明（AGPL-3.0 第 5(a) 条要求的"已修改"标注）
+- 修改者：guiyuqi（个人使用 / 学习用途，非项目作者，非官方发布）
+- 修改日期：2026-10-04
+- 修改性质：新增功能（MCP 控制面、播客/电台子系统、若干设置项）与缺陷修复；
+  未修改任何第三方库源码，未新增 npm 依赖（补丁不包含 package.json 改动）。
+- 逐条改动、证据等级与未验证点见 CHANGES.md。
+
+三、上游版权与许可
+- SPlayer-Next：Copyright (C) imsyy 及贡献者，以 **GNU AGPL-3.0** 授权（见 LICENSE）。
+  本补丁集是该项目的衍生作品，同样以 **AGPL-3.0** 授权；
+  完整对应源码 = 上游源码（提交 4c60335 及之后）+ 本补丁集。
+- 原始版权声明与许可文件必须保留，不得移除或修改；本补丁集未改动 LICENSE 文件。
+
+四、第三方与参考项目（本仓库**未包含**其任何代码或二进制）
+- SPlayer（https://github.com/SPlayer-Dev/SPlayer，AGPL-3.0）：播客/电台交互与接口用法的参考实现。
+- NeteaseCloudMusicApi（https://github.com/Binaryify/NeteaseCloudMusicApi，MIT，4.32.0）：
+  仅参考其 `/dj/*` 接口的路径与参数契约；未复制其代码。补丁中的 13 个 `dj_*.ts` 模块是
+  按该契约与本机联调结果自行编写的。
+- Apple Music-like-lyrics（AGPL-3.0）、lyric-dom、Hono、@modelcontextprotocol/sdk 等：
+  均为 SPlayer-Next 既有依赖，本次补丁未改动其版本，也未内联其代码。
+
+五、若你基于本补丁构建并分发二进制
+除 AGPL-3.0 的义务（提供完整对应源码、保留声明、标注修改、不得附加额外限制）外，还需自行满足
+随程序分发的第三方许可要求，例如：
+- Electron / Chromium 及其第三方组件（上游安装包内已含 LICENSES.chromium.html，请勿删除）；
+- FFmpeg：SPlayer-Next 的 audio-engine 静态链接 FFmpeg，其许可（LGPL / 视构建选项可能含 GPL）
+  由上游处理，请沿用上游的合规与声明方式；
+- 上游 `resources/native/*.node` 等官方编译产物若随包分发，属于再分发上游二进制，
+  应注明来源版本，并保证对应源码可获得。
+本项目作者不对上述合规问题承担责任。
+
+六、无担保与用途限制
+本补丁集按"现状"提供，不附带任何明示或暗示的担保。部分功能依赖第三方服务（如网易云音乐）的
+接口，使用者需自行确认其使用行为符合相关法律法规与服务条款；请勿用于商业用途或非法用途。
+本补丁集为非官方个人作品；若原作者不希望其存在，将立即删除。
