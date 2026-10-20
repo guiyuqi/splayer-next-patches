@@ -1,0 +1,1708 @@
+From bee44d88e7e0af38d064ebd7bb44f836f1f71197 Mon Sep 17 00:00:00 2001
+From: guiyuqi <210155735+guiyuqi@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 22:09:12 +0800
+Subject: [PATCH] =?UTF-8?q?feat:=20=E5=AE=8F=E9=9F=B3=E9=87=8F=E5=AF=B9?=
+ =?UTF-8?q?=E9=BD=90=E4=B8=8E=E7=AA=97=E5=8F=A3=E5=94=A4=E9=86=92=E5=90=8E?=
+ =?UTF-8?q?=E7=9A=84=E6=92=AD=E6=94=BE/=E6=AD=8C=E8=AF=8D=E6=81=A2?=
+ =?UTF-8?q?=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ electron/main/ipc/cache.ts                 |   7 +
+ electron/main/ipc/config.ts                |  29 +-
+ electron/main/ipc/player.ts                |  70 +++++
+ electron/main/services/macroVolume.ts      |  74 +++++
+ electron/main/window/main.ts               |  10 +
+ electron/preload/index.d.ts                |   5 +
+ electron/preload/index.ts                  |   9 +
+ shared/defaults/settings.ts                |   4 +
+ shared/types/player.ts                     |   5 +
+ shared/types/settings.ts                   |  10 +
+ src/components/player/FullPlayer/index.vue |  84 ++++--
+ src/composables/usePlaybackTime.ts         |   7 +-
+ src/core/player/events.ts                  |  35 ++-
+ src/core/player/index.ts                   | 129 +++++++++
+ src/core/player/preload.spec.ts            |   4 +
+ src/i18n/locales/en-US.json                |  16 +-
+ src/i18n/locales/zh-CN.json                |  16 +-
+ src/services/audioSource.ts                |   4 +-
+ src/services/cacheScheduler.ts             |  19 ++
+ src/services/loudness/gain.spec.ts         |  27 ++
+ src/services/loudness/gain.ts              |  28 ++
+ src/services/loudness/index.ts             | 304 +++++++++++++++++++++
+ src/services/loudness/measure.ts           | 236 ++++++++++++++++
+ src/services/playback.ts                   |  18 ++
+ src/settings/categories/player.ts          |  61 +++++
+ 25 files changed, 1182 insertions(+), 29 deletions(-)
+ create mode 100644 electron/main/services/macroVolume.ts
+ create mode 100644 src/services/loudness/gain.spec.ts
+ create mode 100644 src/services/loudness/gain.ts
+ create mode 100644 src/services/loudness/index.ts
+ create mode 100644 src/services/loudness/measure.ts
+
+diff --git a/electron/main/ipc/cache.ts b/electron/main/ipc/cache.ts
+index da3edfd..5dfd820 100644
+--- a/electron/main/ipc/cache.ts
++++ b/electron/main/ipc/cache.ts
+@@ -17,6 +17,7 @@ import { clearLyricCache } from "@main/database/lyricCache";
+ import { clearLyricTtmlCache } from "@main/database/lyricTtmlCache";
+ import { clearLyricMatchCache } from "@main/database/lyricMatchCache";
+ import * as songCache from "@main/services/songCache";
++import { toCacheUrl } from "@main/utils/protocol";
+ import type { TrackSource } from "@shared/types/player";
+ import { systemLog } from "@main/utils/logger";
+ import { defaultCacheDir } from "@main/utils/paths";
+@@ -251,6 +252,12 @@ export const registerCacheIpc = (): void => {
+     songCache.lookup(cacheKey),
+   );
+ 
++  /** 歌曲文件级缓存：命中缓存的 cache:// 地址（渲染端整曲响度测量取样用） */
++  ipcMain.handle("cache:song:url", async (_event, cacheKey: string): Promise<string | null> => {
++    const filePath = await songCache.lookup(cacheKey);
++    return filePath ? (toCacheUrl(filePath) ?? null) : null;
++  });
++
+   /** 歌曲文件级缓存：排队下载 */
+   ipcMain.handle(
+     "cache:song:fetch",
+diff --git a/electron/main/ipc/config.ts b/electron/main/ipc/config.ts
+index fba0f43..4228b5c 100644
+--- a/electron/main/ipc/config.ts
++++ b/electron/main/ipc/config.ts
+@@ -11,11 +11,10 @@ import {
+ import { reloadConfig as reloadLastfmConfig } from "@main/services/lastfm";
+ import {
+   setNormalizationEnabled,
+-  setEqualizerEnabled,
+   setEqualizerBands,
+-  setPreampGain,
+   setExclusiveMode,
+ } from "@main/services/engine";
++import { applyGainChain, ensureNormalizationOff, resetMacroGain } from "@main/services/macroVolume";
+ import {
+   setTaskbarProgress,
+   applyMainWindowZoom,
+@@ -61,16 +60,36 @@ const applyConfigChange = (keyPath: string, value: unknown): void => {
+       reloadLastfmConfig();
+       break;
+     case "player.loudnessNormalization":
++      // 与宏音量互斥：开了实时 AGC 就关掉宏音量，避免两套基准互相拉扯
++      if (value === true && store.get("player.macroVolume.enabled")) {
++        store.set("player.macroVolume.enabled", false);
++        resetMacroGain();
++        systemLog.info("启用音量均衡，已关闭宏音量对齐");
++      }
+       setNormalizationEnabled(value as boolean);
+       break;
+     case "player.equalizer.enabled":
+-      setEqualizerEnabled(value as boolean);
++    case "player.equalizer.preamp":
++      // 前级由用户前级与宏音量增益合成，统一走同一条链路写入
++      applyGainChain();
+       break;
+     case "player.equalizer.bands":
+       setEqualizerBands(value as number[]);
+       break;
+-    case "player.equalizer.preamp":
+-      setPreampGain(value as number);
++    case "player.macroVolume.enabled":
++      // 宏音量依赖缓存文件做整曲测量，开启时强制打开歌曲缓存
++      if (value === true) {
++        if (!store.get("cache.songCache.enabled")) {
++          store.set("cache.songCache.enabled", true);
++          systemLog.info("启用宏音量，已强制打开歌曲缓存");
++        }
++      }
++      if (value !== true) resetMacroGain();
++      else ensureNormalizationOff();
++      break;
++    case "player.macroVolume.targetLufs":
++      // 目标响度变化后已校准的增益全部失效，等下一次换曲重新对齐
++      resetMacroGain();
+       break;
+     case "player.audioOutputMode":
+       // 独占模式仅 Windows 引擎支持；切模式后重建输出立即生效
+diff --git a/electron/main/ipc/player.ts b/electron/main/ipc/player.ts
+index 543b4e8..7288ebe 100644
+--- a/electron/main/ipc/player.ts
++++ b/electron/main/ipc/player.ts
+@@ -40,6 +40,7 @@ import * as songCache from "@main/services/songCache";
+ import { parseArtists, parseAlbum, formatArtists, artistNames } from "@main/utils/metadata";
+ import { playerLog } from "@main/utils/logger";
+ import { updatePowerBlocker, releasePowerBlocker } from "@main/utils/powerBlocker";
++import { setMacroGainDb } from "@main/services/macroVolume";
+ import { ErrorCode } from "@shared/types/errors";
+ import type {
+   Artist,
+@@ -85,6 +86,57 @@ const toDisplayDurationMs = (durationMs: number): number =>
+ const toEnginePositionMs = (positionMs: number): number =>
+   activeCueRange ? activeCueRange.startMs + positionMs : positionMs;
+ 
++/** 唤醒补发快照的去抖计时器 */
++let wakeSnapshotTimer: NodeJS.Timeout | null = null;
++
++/** 已挂上可见性监听的主窗口，避免重复挂载 */
++let wakeHookedWindow: ReturnType<typeof getMainWindow> = null;
++
++/**
++ * 主窗口重新可见时补发一次全量快照
++ *
++ * 隐藏期间位置与频谱推送按约定跳过，恢复瞬间渲染端没有新位置可依赖，
++ * 进度条与歌词会停在旧值；这里补发状态与位置，不改动播放状态，
++ * 因此唤醒后不会自动开始播放。
++ * @param reason - 触发来源，写入日志便于定位
++ */
++const pushPlaybackSnapshot = (reason: string): void => {
++  if (wakeSnapshotTimer) clearTimeout(wakeSnapshotTimer);
++  wakeSnapshotTimer = setTimeout(() => {
++    wakeSnapshotTimer = null;
++    try {
++      const inst = getPlayer();
++      const raw = inst.getStatus();
++      const position = toDisplayPositionMs(toMs(raw.position));
++      const duration = toDisplayDurationMs(toMs(raw.duration));
++      sendToMain("player:event", {
++        type: "status",
++        data: {
++          state: raw.state as PlayerState,
++          position,
++          duration,
++          volume: inst.getVolume(),
++          speed: inst.getSpeed(),
++          isFinished: false,
++        },
++      });
++      sendToMain("player:event", { type: "position", data: { position, duration } });
++      playerLog.info(`主窗口恢复可见，已补发播放快照（${reason}）`);
++    } catch (error) {
++      playerLog.warn("补发播放快照失败:", error);
++    }
++  }, 300);
++};
++
++/** 为主窗口挂载显示与恢复监听 */
++const hookMainWindowVisibility = (): void => {
++  const win = getMainWindow();
++  if (!win || win === wakeHookedWindow) return;
++  wakeHookedWindow = win;
++  win.on("show", () => pushPlaybackSnapshot("show"));
++  win.on("restore", () => pushPlaybackSnapshot("restore"));
++};
++
+ /** 返回失败响应，附带日志 */
+ const fail = (code: ErrorCode, error?: unknown) => {
+   if (error) playerLog.error(`${code}:`, error);
+@@ -684,6 +736,16 @@ export const registerPlayerIpc = (): void => {
+     }
+   });
+ 
++  // 设置当前曲目的宏音量增益（dB，0 表示不校准）
++  ipcMain.handle("player:setMacroGain", (_event, gainDb: number) => {
++    try {
++      setMacroGainDb(gainDb);
++      return { success: true };
++    } catch (error) {
++      return fail(ErrorCode.UNKNOWN, error);
++    }
++  });
++
+   // 启用/禁用音量均衡
+   ipcMain.handle("player:setNormalizationEnabled", (_event, enabled: boolean) => {
+     try {
+@@ -957,6 +1019,13 @@ export const registerPlayerIpc = (): void => {
+       }
+     } catch {}
+   });
++  // 主窗口重新可见（最小化恢复 / 从托盘唤回 / alt-tab）时补齐隐藏期间跳过的高频推送
++  hookMainWindowVisibility();
++  app.on("browser-window-focus", (_event, win) => {
++    if (win !== getMainWindow()) return;
++    hookMainWindowVisibility();
++    pushPlaybackSnapshot("focus");
++  });
+   // 系统进入睡眠时暂停播放
+   powerMonitor.on("suspend", () => {
+     try {
+@@ -977,6 +1046,7 @@ export const registerPlayerIpc = (): void => {
+       try {
+         await inst.reinitOutput();
+         playerLog.info(`唤醒后重建音频输出成功（第 ${i + 1} 次尝试）`);
++        pushPlaybackSnapshot("system-resume");
+         return;
+       } catch (error) {
+         playerLog.warn(`重建音频输出第 ${i + 1} 次失败:`, error);
+diff --git a/electron/main/services/macroVolume.ts b/electron/main/services/macroVolume.ts
+new file mode 100644
+index 0000000..69a777a
+--- /dev/null
++++ b/electron/main/services/macroVolume.ts
+@@ -0,0 +1,74 @@
++/**
++ * 宏音量（整曲恒定增益）
++ *
++ * 每首歌测出整曲积分响度后算一个恒定增益，让不同歌曲的相对音量保持一致。
++ * 引擎侧没有独立的增益入口，这里复用均衡器前级：全频段 0dB 时滤波器是逐采样直通，
++ * 所以「开均衡器 + 只改前级」等价于给整首歌乘一个常数，同时顺带启用限幅器做削波保护。
++ *
++ * 组合规则固定在这里，避免渲染端与设置页各自拼前级导致互相覆盖。
++ */
++
++import { store } from "@main/store";
++import { setEqualizerEnabled, setNormalizationEnabled, setPreampGain } from "@main/services/engine";
++import { playerLog } from "@main/utils/logger";
++
++/** 前级允许范围（dB），超出会被引擎钳制 */
++const PREAMP_LIMIT_DB = 12;
++
++/** 当前曲目的宏音量增益（dB），0 表示不校准 */
++let macroGainDb = 0;
++
++const userPreampDb = (): number => store.get("player.equalizer.preamp") ?? 0;
++const userEqualizerEnabled = (): boolean => store.get("player.equalizer.enabled") === true;
++
++/**
++ * 把「用户前级 + 宏音量增益」写进引擎
++ *
++ * 宏音量生效时必须打开均衡器：前级只在均衡器启用时才参与处理，
++ * 而且这样限幅器也会介入，正增益不会把输出推到削波。
++ */
++export const applyGainChain = (): void => {
++  const userPreamp = userPreampDb();
++  const total = Math.max(-PREAMP_LIMIT_DB, Math.min(PREAMP_LIMIT_DB, userPreamp + macroGainDb));
++  if (total !== userPreamp + macroGainDb) {
++    playerLog.warn(`宏音量前级超范围已钳制: ${userPreamp + macroGainDb}dB → ${total}dB`);
++  }
++  setPreampGain(total);
++  setEqualizerEnabled(userEqualizerEnabled() || Math.abs(macroGainDb) > 0.01);
++};
++
++/**
++ * 设置当前曲目的宏音量增益
++ * @param gainDb - 恒定增益（dB），0 表示不校准
++ */
++export const setMacroGainDb = (gainDb: number): void => {
++  const value = Number.isFinite(gainDb) ? gainDb : 0;
++  if (Math.abs(value - macroGainDb) < 0.01) return;
++  macroGainDb = value;
++  if (value !== 0) ensureNormalizationOff();
++  applyGainChain();
++  playerLog.info(`宏音量增益已应用: ${value.toFixed(2)}dB`);
++};
++
++/**
++ * 确保宏音量与实时 AGC 不会同时生效
++ *
++ * 实时 AGC 会在播放过程中把响度拉回自己的目标，等于把宏音量的恒定增益抵消掉，
++ * 两者同时开启只会得到「既没对齐、又忽大忽小」。宏音量优先，这里把 AGC 关掉。
++ */
++export const ensureNormalizationOff = (): void => {
++  if (!store.get("player.loudnessNormalization")) return;
++  store.set("player.loudnessNormalization", false);
++  setNormalizationEnabled(false);
++  playerLog.info("宏音量生效中，已停用音量均衡（实时 AGC 会抵消恒定增益）");
++};
++
++/** 当前宏音量增益（dB） */
++export const getMacroGainDb = (): number => macroGainDb;
++
++/** 清空宏音量增益（换曲、关闭功能、场景不适用时调用） */
++export const resetMacroGain = (): void => {
++  if (macroGainDb === 0) return;
++  macroGainDb = 0;
++  applyGainChain();
++};
+diff --git a/electron/main/window/main.ts b/electron/main/window/main.ts
+index c696fbc..a41efd9 100644
+--- a/electron/main/window/main.ts
++++ b/electron/main/window/main.ts
+@@ -6,6 +6,7 @@ import { initThumbar } from "@main/services/thumbar";
+ import { enableTaskbarThumbnail } from "@main/services/thumbnail";
+ import { initTray } from "@main/services/tray";
+ import { store } from "@main/store";
++import { coreLog } from "@main/utils/logger";
+ import { handleCacheProtocolOnPartition, MAIN_PARTITION } from "@main/utils/protocol";
+ import { isAppQuitting } from "@main/utils/lifecycle";
+ import { broadcast } from "@main/utils/broadcast";
+@@ -79,6 +80,15 @@ export const createMainWindow = (): BrowserWindow => {
+     applyMainWindowZoom();
+   });
+ 
++  // 渲染端日志写入主进程日志，生产包没有 devtools 时仍可回溯
++  mainWindow.webContents.on("console-message", ({ level, message }) => {
++    if (level === "debug") return;
++    const text = message.slice(0, 400);
++    if (level === "error") coreLog.error(`(renderer) ${text}`);
++    else if (level === "warning") coreLog.warn(`(renderer) ${text}`);
++    else coreLog.info(`(renderer) ${text}`);
++  });
++
+   // 保存窗口状态
+   const saveWindowState = (): void => {
+     if (!mainWindow || mainWindow.isDestroyed()) return;
+diff --git a/electron/preload/index.d.ts b/electron/preload/index.d.ts
+index de86f61..f60449b 100644
+--- a/electron/preload/index.d.ts
++++ b/electron/preload/index.d.ts
+@@ -97,6 +97,11 @@ declare global {
+         resetDir: () => Promise<string>;
+         song: {
+           lookup: (cacheKey: string) => Promise<string | null>;
++          /**
++           * 命中缓存的 cache:// 地址
++           * @param cacheKey - 音源与音质对应的缓存键
++           */
++          url: (cacheKey: string) => Promise<string | null>;
+           /**
+            * 下载歌曲到缓存并按预载消费者保留文件
+            * @param cacheKey - 音源与音质对应的缓存键
+diff --git a/electron/preload/index.ts b/electron/preload/index.ts
+index 18035ef..1dce745 100644
+--- a/electron/preload/index.ts
++++ b/electron/preload/index.ts
+@@ -124,6 +124,9 @@ const api = {
+     getFadeDuration: () => ipcRenderer.invoke("player:getFadeDuration"),
+     // 获取播放状态快照
+     getStatus: () => ipcRenderer.invoke("player:getStatus"),
++    // 设置当前曲目的宏音量增益（dB，0 表示不校准）
++    setMacroGain: (gainDb: number): Promise<{ success: boolean }> =>
++      ipcRenderer.invoke("player:setMacroGain", gainDb),
+     // 获取当前真实的音频流与输出参数
+     getStreamInfo: () => ipcRenderer.invoke("player:getStreamInfo"),
+     // 获取 FFT 频谱数据
+@@ -560,6 +563,12 @@ const api = {
+       // 命中查询：返回本地绝对路径或 null
+       lookup: (cacheKey: string): Promise<string | null> =>
+         ipcRenderer.invoke("cache:song:lookup", cacheKey),
++      /**
++       * 命中缓存的 cache:// 地址，未命中返回 null
++       * @param cacheKey - 音源与音质对应的缓存键
++       */
++      url: (cacheKey: string): Promise<string | null> =>
++        ipcRenderer.invoke("cache:song:url", cacheKey),
+       /**
+        * 下载歌曲到缓存，预载调用方需要等待下载完成
+        * @param cacheKey - 音源与音质对应的缓存键
+diff --git a/shared/defaults/settings.ts b/shared/defaults/settings.ts
+index 289ad40..d186a0b 100644
+--- a/shared/defaults/settings.ts
++++ b/shared/defaults/settings.ts
+@@ -20,6 +20,10 @@ export const defaultSystemConfig: SystemConfig = {
+     outputDevice: null,
+     volume: 1,
+     loudnessNormalization: false,
++    macroVolume: {
++      enabled: false,
++      targetLufs: -18,
++    },
+     audioOutputMode: "shared",
+     equalizer: {
+       enabled: false,
+diff --git a/shared/types/player.ts b/shared/types/player.ts
+index d1e3846..d464f1e 100644
+--- a/shared/types/player.ts
++++ b/shared/types/player.ts
+@@ -358,6 +358,11 @@ export interface PlayerApi {
+   reinit: () => Promise<IpcResponse>;
+   /** 设置音量均衡 */
+   setNormalizationEnabled: (enabled: boolean) => Promise<IpcResponse>;
++  /**
++   * 设置当前曲目的宏音量增益
++   * @param gainDb - 恒定增益（dB），0 表示不校准
++   */
++  setMacroGain: (gainDb: number) => Promise<IpcResponse>;
+   /** 启用/禁用 10 频段均衡器 */
+   setEqualizerEnabled: (enabled: boolean) => Promise<IpcResponse>;
+   /** 更新均衡器各频段增益（dB 数组，长度 10） */
+diff --git a/shared/types/settings.ts b/shared/types/settings.ts
+index 061d1ed..9fa5268 100644
+--- a/shared/types/settings.ts
++++ b/shared/types/settings.ts
+@@ -39,6 +39,14 @@ export interface EqualizerSettings {
+ /** 音频输出模式 */
+ export type AudioOutputMode = "shared" | "exclusive";
+ 
++/** 宏音量（整曲恒定增益）配置 */
++export interface MacroVolumeSettings {
++  /** 是否启用宏音量对齐 */
++  enabled: boolean;
++  /** 目标响度（LUFS），范围 [-23, -14] */
++  targetLufs: number;
++}
++
+ /** 播放器配置 */
+ export interface PlayerSettings {
+   /** 加载后自动播放 */
+@@ -55,6 +63,8 @@ export interface PlayerSettings {
+   volume: number;
+   /** 音量均衡（响度归一化） */
+   loudnessNormalization: boolean;
++  /** 宏音量（整曲恒定增益） */
++  macroVolume: MacroVolumeSettings;
+   /** 音频输出模式：共享（默认）/ WASAPI 独占（仅 Windows） */
+   audioOutputMode: AudioOutputMode;
+   /** 均衡器配置 */
+diff --git a/src/components/player/FullPlayer/index.vue b/src/components/player/FullPlayer/index.vue
+index d348d79..550ec4f 100644
+--- a/src/components/player/FullPlayer/index.vue
++++ b/src/components/player/FullPlayer/index.vue
+@@ -52,32 +52,86 @@ const hasTrack = computed(() => !!displayTrack.value);
+ 
+ /** 精确播放时间（毫秒） */
+ const { start: startTick, stop: stopTick } = usePlaybackTime((currentMs) => {
+-  if (!status.trackLoading && !media.lyricLoading) {
+-    lyricRef.value?.setCurrentTime(currentMs + status.lyricOffsetMs, player.isSeeking());
+-  }
++  // 不按加载标记跳过：加载可能因网络长期不结束，而时钟一停，
++  // 歌词高亮与滚动就会永久冻在旧位置；换歌时歌词已先被清空，引擎对空行不做处理
++  lyricRef.value?.setCurrentTime(currentMs + status.lyricOffsetMs, player.isSeeking());
+ });
+ 
+-/** 展开后 */
+-const onAfterEnter = () => {
+-  nextTick(() => {
++/** 防重入：唤醒过程中派发的 visibilitychange 会再次进到这里 */
++let waking = false;
++
++/**
++ * 窗口重新可见 / 获得焦点时唤醒歌词
++ *
++ * 后台期间渲染被节流，歌词引擎的动画帧、内部可见性标记与推进时钟
++ * 都可能停在旧值；回到前台后统一重启并按当前位置强制对齐一次。
++ */
++const handleWake = (): void => {
++  if (!lyricMounted.value || waking) return;
++  waking = true;
++  try {
++    // 入场动画若在后台跑完，after-enter 可能没触发，引擎会停在冻结态
+     lyricRef.value?.resume();
+     startTick();
+-  });
++    // 歌词引擎自己缓存了页面可见性，若它错过了恢复事件会整体跳帧；
++    // 这里补发一次可见性通知，让它重新读取 document.hidden 并重排
++    document.dispatchEvent(new Event("visibilitychange"));
++    const anchored = getCurrentTime() + status.lyricOffsetMs;
++    lyricRef.value?.setCurrentTime(anchored, true);
++    console.info(
++      `[lyric] 窗口恢复 hidden=${document.hidden} 时钟=${Math.round(anchored)} 进度=${Math.round(
++        status.position,
++      )} 加载=${status.trackLoading}/${media.lyricLoading}`,
++    );
++  } finally {
++    waking = false;
++  }
++};
++
++/** 页面可见性变化：仅从隐藏恢复时对账 */
++const handleVisibilityWake = (): void => {
++  if (!document.hidden) handleWake();
+ };
+ 
++onMounted(() => {
++  window.addEventListener("focus", handleWake);
++  document.addEventListener("visibilitychange", handleVisibilityWake);
++});
++
++onBeforeUnmount(() => {
++  window.removeEventListener("focus", handleWake);
++  document.removeEventListener("visibilitychange", handleVisibilityWake);
++});
++
++/**
++ * 展开状态直接驱动引擎与推进时钟
++ *
++ * 不依赖过渡钩子：窗口在后台时过渡可能整段跑在无帧环境里，
++ * after-enter 不触发就会留下「时钟没启动 / 引擎冻结」的僵局。
++ */
++watch(
++  isPlayerExpanded,
++  (expanded) => {
++    if (expanded) {
++      nextTick(() => {
++        lyricRef.value?.resume();
++        startTick();
++      });
++    } else {
++      lyricRef.value?.freeze();
++      stopTick();
++    }
++  },
++  { flush: "post" },
++);
++
+ /** 展开动画开始时就挂载歌词，给引擎预留初始化时间 */
+ const onBeforeEnter = () => {
+   initialLyricTimeMs.value = getCurrentTime() + status.lyricOffsetMs;
+   lyricMounted.value = true;
+ };
+ 
+-/** 收起前 */
+-const onBeforeLeave = () => {
+-  lyricRef.value?.freeze();
+-  stopTick();
+-};
+-
+-/** 收起后 */
++/** 收起后卸载歌词，避免屏外继续占用渲染资源 */
+ const onAfterLeave = () => {
+   lyricMounted.value = false;
+ };
+@@ -188,9 +242,7 @@ const showComments = (): void => {
+       leave-active-class="transition-transform duration-500 ease-[cubic-bezier(0.7,0,0.3,1)]"
+       enter-from-class="translate-y-full"
+       leave-to-class="translate-y-full"
+-      @after-enter="onAfterEnter"
+       @before-enter="onBeforeEnter"
+-      @before-leave="onBeforeLeave"
+       @after-leave="onAfterLeave"
+     >
+       <div
+diff --git a/src/composables/usePlaybackTime.ts b/src/composables/usePlaybackTime.ts
+index 27fa568..97f1cd5 100644
+--- a/src/composables/usePlaybackTime.ts
++++ b/src/composables/usePlaybackTime.ts
+@@ -15,8 +15,13 @@ export const usePlaybackTime = (
+   let rafId: number | null = null;
+ 
+   const tick = (): void => {
+-    onTick(Math.round(getCurrentTime()), Math.round(getDuration()), isPlaying());
++    // 先续帧再回调：歌词引擎等第三方渲染器一旦抛错，帧链不会就此断掉
+     rafId = requestAnimationFrame(tick);
++    try {
++      onTick(Math.round(getCurrentTime()), Math.round(getDuration()), isPlaying());
++    } catch (error) {
++      console.error("[playback] 时间回调异常", error);
++    }
+   };
+ 
+   const start = (): void => {
+diff --git a/src/core/player/events.ts b/src/core/player/events.ts
+index 8835ad4..4701fa6 100644
+--- a/src/core/player/events.ts
++++ b/src/core/player/events.ts
+@@ -69,6 +69,30 @@ const finishCurrentTrack = async (): Promise<void> => {
+   }
+ };
+ 
++/**
++ * 位置推送被丢弃的日志节流时刻
++ *
++ * 位置推送直接决定进度条与歌词时钟，被丢弃时必须能从日志看出是哪道门拦下的
++ */
++let lastDropLogAt = 0;
++
++/**
++ * 记录一次位置推送被丢弃的原因
++ * @param reason - 拦截位置推送的条件
++ * @param position - 被丢弃的位置（毫秒）
++ */
++const logPositionDrop = (reason: string, position: number): void => {
++  const now = performance.now();
++  if (now - lastDropLogAt < 5000) return;
++  lastDropLogAt = now;
++  const status = useStatusStore();
++  console.warn(
++    `[player] 位置推送被丢弃(${reason}) pos=${Math.round(position)} 加载=${
++      status.trackLoading
++    } 状态=${status.state}`,
++  );
++};
++
+ /**
+  * 处理主进程推送的播放事件
+  * @param event - 播放事件
+@@ -115,9 +139,16 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
+       break;
+     case "position": {
+       // 歌曲加载中不更新进度
+-      if (status.trackLoading) break;
++      if (status.trackLoading) {
++        logPositionDrop("trackLoading", event.data.position);
++        break;
++      }
+       // seek 后丢弃旧位置，直到后端推送的位置到达 seek 目标附近
+-      if (!hasReachedSeekTarget(event.data.position)) break;
++      if (!hasReachedSeekTarget(event.data.position)) {
++        logPositionDrop("seekTarget", event.data.position);
++        break;
++      }
++      playback.notePositionPush();
+       const adjusted = playback.setCurrentTime(event.data.position);
+       status.position = adjusted;
+       if (event.data.duration > 0) {
+diff --git a/src/core/player/index.ts b/src/core/player/index.ts
+index a2d4c7e..13383d1 100644
+--- a/src/core/player/index.ts
++++ b/src/core/player/index.ts
+@@ -19,6 +19,7 @@ import * as coverLoader from "@/services/coverLoader";
+ import * as abLoop from "@/services/abLoop";
+ import * as autoClose from "@/services/autoClose";
+ import * as cacheScheduler from "@/services/cacheScheduler";
++import * as loudness from "@/services/loudness";
+ import { getDeviceVolume, setDeviceVolume } from "@/services/deviceVolume";
+ import { resolveTrackSource, type ResolvedTrackSource } from "@/services/audioSource";
+ import {
+@@ -39,6 +40,7 @@ import { ErrorCode } from "@shared/types/errors";
+ import { shouldSkipKeywordTrack } from "@/utils/preset/skipKeywords";
+ import { toast } from "@/composables/useToast";
+ import i18n from "@/i18n";
++import { watch } from "vue";
+ 
+ /** 加载运行时选项 */
+ interface LoadRuntimeOptions {
+@@ -160,6 +162,7 @@ export const load = async (
+   abLoop.reset();
+   // 清除上一次 seek 残留
+   seekTarget = null;
++  seekTargetAt = 0;
+   playback.setSeeking(false);
+   resetForLoad(meta?.duration ?? 0, options.transitionResult?.data?.playback);
+   // 非本地并行歌词与取色
+@@ -169,6 +172,8 @@ export const load = async (
+     extractColorFromUrl(meta?.cover ?? meta?.coverOriginal ?? null);
+     if (meta) void coverLoader.loadCoverForTrack(meta);
+   }
++  // 播放前对齐宏音量：命中已校准结果时从第一个采样起就是恒定增益
++  await loudness.applyMacroVolume(meta ?? useMediaStore().track, options.context);
+   try {
+     const result =
+       options.transitionResult ??
+@@ -587,6 +592,17 @@ export const stop = async (): Promise<void> => {
+  */
+ let seekTarget: number | null = null;
+ 
++/** seek 目标的登记时刻，用于判定失效 */
++let seekTargetAt = 0;
++
++/**
++ * seek 目标有效期（毫秒）
++ *
++ * 引擎可能因为源失效、解码线程重建等原因永远到不了目标位置，
++ * 此时若继续屏蔽推送，进度条与歌词会永久停在 seek 前的位置
++ */
++const SEEK_TARGET_TIMEOUT_MS = 3000;
++
+ /**
+  * 判断后端推送的 position 是否已到达 seek 目标附近
+  * @param position - 后端推送的播放位置（毫秒）
+@@ -600,6 +616,16 @@ export const hasReachedSeekTarget = (position: number): boolean => {
+     playback.setSeeking(false);
+     return true;
+   }
++  if (Date.now() - seekTargetAt > SEEK_TARGET_TIMEOUT_MS) {
++    console.warn(
++      `[player] seek 目标超时未到达，恢复位置推送 target=${Math.round(seekTarget)} now=${Math.round(
++        position,
++      )}`,
++    );
++    seekTarget = null;
++    playback.setSeeking(false);
++    return true;
++  }
+   return false;
+ };
+ 
+@@ -623,6 +649,7 @@ export const seek = async (posMs: number): Promise<void> => {
+ 
+   // 设置 seek 目标，屏蔽旧 position 推送
+   seekTarget = posMs;
++  seekTargetAt = Date.now();
+ 
+   const result = await window.api.player.seek(posMs);
+   if (token !== trackToken) return;
+@@ -644,6 +671,7 @@ export const markSeek = (posMs: number): void => {
+   status.position = posMs;
+   playback.setCurrentTime(posMs);
+   seekTarget = posMs;
++  seekTargetAt = Date.now();
+ };
+ 
+ /**
+@@ -1312,6 +1340,89 @@ export const moveInQueue = (fromIndex: number, toIndex: number): void => {
+ let unsubscribe: (() => void) | null = null;
+ let initialized = false;
+ 
++/** 位置推送停滞判定阈值（毫秒），引擎每 200ms 推送一次 */
++const POSITION_STALL_MS = 3000;
++
++/** 停滞巡检周期（毫秒） */
++const STALL_CHECK_INTERVAL_MS = 2000;
++
++let stallTimer: ReturnType<typeof setInterval> | null = null;
++/** 对账进行中，避免重复发起 */
++let resyncing = false;
++
++/**
++ * 与主进程对账当前播放状态
++ *
++ * 进度条与歌词都依赖主进程的位置推送，推送一旦停摆（窗口隐藏后未恢复、
++ * 加载标记没有落下）渲染端会永久停在旧值；这里以引擎快照为准重新锚定。
++ * 只做状态对齐，不发起播放，因此唤醒后不会自动开始播放。
++ * @param reason - 触发原因，写入日志便于定位
++ */
++export const resyncFromEngine = async (reason: string): Promise<void> => {
++  if (resyncing) return;
++  resyncing = true;
++  try {
++    const status = useStatusStore();
++    const res = await window.api.player.getStatus();
++    if (!res.success || !res.data) return;
++    const { state, position, duration, volume, speed } = res.data;
++    // 引擎仍在加载新音源：保持加载态，交给正常的加载流程收尾
++    if (state === "loading") return;
++    // 引擎已在播放而加载标记没落下，说明加载流程丢了收尾
++    if (state === "playing") status.trackLoading = false;
++    else if (status.trackLoading) return;
++    status.state = state;
++    status.duration = duration;
++    if (status.volume !== volume) status.volume = volume;
++    if (speed != null) {
++      status.speed = speed;
++      playback.setSpeed(speed);
++    }
++    playback.setDuration(duration);
++    playback.setPlaying(state === "playing");
++    // 引擎快照是权威的：卡住的 seek 屏蔽在这里一并解除，否则推送会被永久丢弃
++    if (isSeeking()) {
++      console.warn(`[player] 解除卡住的 seek 屏蔽 target=${Math.round(seekTarget ?? 0)}`);
++      seekTarget = null;
++      seekTargetAt = 0;
++      playback.setSeeking(false);
++    }
++    const anchored = playback.setCurrentTime(position, { force: true });
++    status.position = anchored;
++    useMediaStore().updateLyricIndex(anchored + status.lyricOffsetMs);
++    playback.notePositionPush();
++    console.warn(
++      `[player] 播放状态已对账(${reason}) state=${state} pos=${Math.round(position)} dur=${Math.round(
++        duration,
++      )}`,
++    );
++  } catch (error) {
++    console.warn("[player] 播放状态对账失败", error);
++  } finally {
++    resyncing = false;
++  }
++};
++
++/** 启动位置推送停滞巡检 */
++const startStallWatchdog = (): void => {
++  if (stallTimer) return;
++  stallTimer = setInterval(() => {
++    // 窗口隐藏时主进程按约定停发高频推送，这里没有对账的必要
++    if (document.hidden) return;
++    const status = useStatusStore();
++    if (status.state !== "playing") return;
++    if (playback.getMsSinceLastPush() < POSITION_STALL_MS) return;
++    void resyncFromEngine(isSeeking() ? "seek-stall" : "position-stall");
++  }, STALL_CHECK_INTERVAL_MS);
++};
++
++/** 停止位置推送停滞巡检 */
++const stopStallWatchdog = (): void => {
++  if (!stallTimer) return;
++  clearInterval(stallTimer);
++  stallTimer = null;
++};
++
+ /** 初始化播放器 */
+ export const initPlayer = async (): Promise<void> => {
+   if (initialized) return;
+@@ -1360,8 +1471,25 @@ export const initPlayer = async (): Promise<void> => {
+   // 先订阅事件，确保 load 触发播放后 position 事件能被接收
+   if (unsubscribe) unsubscribe();
+   unsubscribe = window.api.player.onEvent(handleEvent);
++  // 位置推送停摆时自动对账，避免进度条与歌词永久停在旧值
++  startStallWatchdog();
+   // 安装播放统计累加器
+   installPlayStats();
++  // 宏音量开关或目标响度变化后立即重算，关闭时增益归零
++  watch(
++    () => [
++      settings.system.player.macroVolume?.enabled,
++      settings.system.player.macroVolume?.targetLufs,
++    ],
++    () => {
++      const current = useMediaStore();
++      if (!settings.system.player.macroVolume?.enabled) {
++        loudness.clearMacroVolume();
++        return;
++      }
++      void loudness.applyMacroVolume(current.track, current.playbackContext);
++    },
++  );
+   // 订阅主进程下发的歌词偏移变化
+   const media = useMediaStore();
+   // 当前歌曲喜欢状态变化时同步到托盘菜单
+@@ -1438,6 +1566,7 @@ export const restoreLastTrack = async (): Promise<void> => {
+ /** 清理事件订阅 */
+ export const disposePlayer = (): void => {
+   disposeNextTrackPreload();
++  stopStallWatchdog();
+   if (unsubscribe) {
+     unsubscribe();
+     unsubscribe = null;
+diff --git a/src/core/player/preload.spec.ts b/src/core/player/preload.spec.ts
+index 332bb3c..63599e9 100644
+--- a/src/core/player/preload.spec.ts
++++ b/src/core/player/preload.spec.ts
+@@ -83,6 +83,10 @@ vi.mock("@/services/lyric/loader", () => ({ beginLoad: vi.fn(), loadForTrack: vi
+ vi.mock("@/services/coverLoader", () => ({ loadCoverForTrack: vi.fn() }));
+ vi.mock("@/services/abLoop", () => ({ reset: vi.fn() }));
+ vi.mock("@/services/cacheScheduler", () => ({ cancel: vi.fn(), schedule: vi.fn() }));
++vi.mock("@/services/loudness", () => ({
++  applyMacroVolume: vi.fn(async () => {}),
++  clearMacroVolume: vi.fn(),
++}));
+ vi.mock("@/services/deviceVolume", () => ({ getDeviceVolume: vi.fn(), setDeviceVolume: vi.fn() }));
+ vi.mock("@/services/audioSource", () => ({ resolveTrackSource: mocks.resolve }));
+ vi.mock("@/services/nextTrackPreloader", () => ({
+diff --git a/src/i18n/locales/en-US.json b/src/i18n/locales/en-US.json
+index 466b643..0f1bb81 100644
+--- a/src/i18n/locales/en-US.json
++++ b/src/i18n/locales/en-US.json
+@@ -919,8 +919,16 @@
+       "description": "Fade in/out duration (ms)"
+     },
+     "loudnessNormalization": {
+-      "label": "Loudness Normalization",
+-      "description": "Automatically balance volume levels between tracks"
++      "label": "Loudness Normalization (superseded)",
++      "description": "Legacy live AGC that keeps adjusting gain while playing, so levels can still drift within a track; mutually exclusive with Macro Volume Alignment. Recommend turning it off and using Macro Volume Alignment"
++    },
++    "macroVolume": {
++      "label": "Macro Volume Alignment",
++      "description": "Measures each track's integrated loudness and applies one constant gain; requires song cache, exclusive with loudness normalization, skipped for albums and podcasts"
++    },
++    "macroVolumeTarget": {
++      "label": "Target Loudness",
++      "description": "Integrated loudness after alignment (LUFS); lower means quieter"
+     },
+     "transitionMode": {
+       "label": "Transition mode",
+@@ -1160,6 +1168,10 @@
+       "kugouLoginVersionContent": "After switching, the current credentials will not match the new version. You must log out and scan the QR code again, or VIP privileges and high-quality playback will stop working. Switch anyway?",
+       "exclusiveModeTitle": "Switch to Exclusive Mode",
+       "exclusiveModeContent": "Exclusive mode bypasses the system mixer and prefers the source sample rate and bit depth, making it suitable for external DACs / Hi-Fi gear. Player volume, EQ and other processing still apply, so bit-perfect output is not guaranteed. Other apps may be unable to play audio while exclusive. If exclusive mode is unavailable, shared mode will be attempted; it may also fail if another app holds the device exclusively. Switch anyway?",
++      "loudnessExclusiveTitle": "Macro volume will be disabled",
++      "loudnessExclusiveContent": "Loudness Normalization is a live AGC that keeps pulling loudness back to its own target; running both cancels each other out. Continuing disables Macro Volume Alignment.",
++      "macroVolumeCacheTitle": "Song cache required",
++      "macroVolumeCacheContent": "Macro volume needs the whole file to measure loudness, so the song and streaming caches are enabled too. If Loudness Normalization is on it will be turned off: that is a live AGC which keeps pulling loudness back to its own target and cancels the constant gain.",
+       "preloadCacheTitle": "Enable the caches required for preloading?",
+       "preloadCacheContent": "Preloading requires caching the next track's audio. Continuing will enable both song caching and streaming caching, which may increase network traffic and disk usage"
+     },
+diff --git a/src/i18n/locales/zh-CN.json b/src/i18n/locales/zh-CN.json
+index 855ac99..868bafd 100644
+--- a/src/i18n/locales/zh-CN.json
++++ b/src/i18n/locales/zh-CN.json
+@@ -907,8 +907,16 @@
+       "description": "渐入渐出的持续时长（毫秒）"
+     },
+     "loudnessNormalization": {
+-      "label": "音量均衡",
+-      "description": "自动调节不同歌曲之间的音量差异"
++      "label": "音量均衡（已由宏音量对齐取代）",
++      "description": "旧版实时 AGC，会随内容不断调整增益，容易出现段内忽大忽小，且与「宏音量对齐」互斥。建议关闭，改用宏音量对齐"
++    },
++    "macroVolume": {
++      "label": "宏音量对齐",
++      "description": "测出每首歌的整曲响度，用恒定增益对齐到目标响度；需要开启歌曲缓存，与音量均衡互斥，听专辑和播客时自动跳过"
++    },
++    "macroVolumeTarget": {
++      "label": "目标响度",
++      "description": "对齐后的整曲响度（LUFS），数值越小越安静"
+     },
+     "transitionMode": {
+       "label": "过渡方式",
+@@ -1148,6 +1156,10 @@
+       "kugouLoginVersionContent": "切换后当前登录凭据与新版本不匹配，需退出登录并重新扫码，否则会员权益与高音质解析会失效。确定切换吗？",
+       "exclusiveModeTitle": "切换到独占模式",
+       "exclusiveModeContent": "独占模式绕过系统混音器，优先使用音源采样率与位深，适合外接 DAC / Hi-Fi 设备。播放器的音量、均衡器等处理仍然生效，不保证逐位无损输出。独占期间其他应用可能无法播放声音；独占不可用时会尝试共享模式，若设备被其他应用独占，共享模式也可能无法播放。确定切换吗？",
++      "loudnessExclusiveTitle": "会关闭宏音量对齐",
++      "loudnessExclusiveContent": "「音量均衡」是实时 AGC，播放中会不断把响度拉回自己的目标，两个功能同时开只会互相抵消：既没对齐、又忽大忽小。继续开启会关闭宏音量对齐。",
++      "macroVolumeCacheTitle": "需要开启歌曲缓存",
++      "macroVolumeCacheContent": "宏音量要先拿到整首音频才能测出响度，所以会同时打开歌曲缓存与流媒体缓存。如果「音量均衡」开着，也会被关闭——它是实时 AGC，会持续把响度拉回自己的目标，和恒定增益互相抵消。",
+       "preloadCacheTitle": "开启预载所需的缓存？",
+       "preloadCacheContent": "歌曲预载需要缓存下一首音频。继续将同时开启歌曲缓存和流媒体缓存，可能增加网络流量和磁盘占用"
+     },
+diff --git a/src/services/audioSource.ts b/src/services/audioSource.ts
+index f438ffe..be67a97 100644
+--- a/src/services/audioSource.ts
++++ b/src/services/audioSource.ts
+@@ -41,12 +41,14 @@ const isOnlinePlatform = (source: TrackSource): source is Platform =>
+ 
+ /**
+  * 派生缓存键
++ *
++ * 宏音量测量取样也用它定位缓存文件
+  * netease / qqmusic 把音质档位并入键，使不同音质的同一首歌互不覆盖
+  * @param track - 要解析的 track
+  * @param songLevel - 在线歌曲音质档位
+  * @returns 派生缓存键，如果该 track 不参与歌曲缓存则返回 null
+  */
+-const cacheKeyForTrack = (track: Track, songLevel: QualityLevel): string | null => {
++export const cacheKeyForTrack = (track: Track, songLevel: QualityLevel): string | null => {
+   if (track.source === "streaming" && track.serverId && track.originalId) {
+     return `s:${track.serverId}:${track.originalId}:`;
+   }
+diff --git a/src/services/cacheScheduler.ts b/src/services/cacheScheduler.ts
+index 1c1477a..bfdf549 100644
+--- a/src/services/cacheScheduler.ts
++++ b/src/services/cacheScheduler.ts
+@@ -19,6 +19,25 @@ export const schedule = (trackId: string, fire: () => void): void => {
+   pending = { trackId, fire };
+ };
+ 
++/**
++ * 立即触发待执行的缓存请求
++ *
++ * 宏音量需要整首音频才能测响度，等 20 秒阈值太晚；调用方确认当前曲目仍是被
++ * 调度的那一首时会立刻下载，下载本身就发生在缓存已开启的前提下
++ * @returns 是否真的触发了下载
++ */
++export const triggerNow = (): boolean => {
++  if (!pending) return false;
++  if (useMediaStore().track?.id !== pending.trackId) {
++    pending = null;
++    return false;
++  }
++  const fire = pending.fire;
++  pending = null;
++  fire();
++  return true;
++};
++
+ /** 取消当前 pending；切歌或新一轮加载前调用 */
+ export const cancel = (): void => {
+   pending = null;
+diff --git a/src/services/loudness/gain.spec.ts b/src/services/loudness/gain.spec.ts
+new file mode 100644
+index 0000000..1d0b94c
+--- /dev/null
++++ b/src/services/loudness/gain.spec.ts
+@@ -0,0 +1,27 @@
++import { describe, expect, it } from "vitest";
++import { computeGainDb, MACRO_GAIN_LIMIT_DB, MACRO_PEAK_CEILING_DB } from "./gain";
++
++describe("宏音量增益换算", () => {
++  it("按目标响度给出增益", () => {
++    expect(computeGainDb(-12, -0.2, -18)).toBe(-6);
++    expect(computeGainDb(-24, -10, -18)).toBe(6);
++  });
++
++  it("抬升量被真峰值余量压住", () => {
++    // 需要 +6dB，但峰值只剩 2.8dB 余量
++    expect(computeGainDb(-24, -3.8, -18)).toBeCloseTo(2.8, 5);
++  });
++
++  it("衰减不受峰值约束", () => {
++    expect(computeGainDb(-6, -0.05, -18)).toBe(Math.max(-12, -12));
++  });
++
++  it("钳制在引擎前级范围内", () => {
++    expect(computeGainDb(-60, -40, -14)).toBe(MACRO_GAIN_LIMIT_DB);
++    expect(computeGainDb(0, -0.01, -23)).toBe(-MACRO_GAIN_LIMIT_DB);
++  });
++
++  it("峰值上限留了余量给限幅器", () => {
++    expect(MACRO_PEAK_CEILING_DB).toBeLessThan(0);
++  });
++});
+diff --git a/src/services/loudness/gain.ts b/src/services/loudness/gain.ts
+new file mode 100644
+index 0000000..1e12162
+--- /dev/null
++++ b/src/services/loudness/gain.ts
+@@ -0,0 +1,28 @@
++/**
++ * 宏音量增益换算
++ *
++ * 纯函数，与设置、引擎解耦，方便单测。
++ */
++
++/** 增益允许范围（dB），与引擎前级上限一致 */
++export const MACRO_GAIN_LIMIT_DB = 12;
++
++/** 真峰值上限（dBFS），留 1dB 余量给限幅器与采样峰值误差 */
++export const MACRO_PEAK_CEILING_DB = -1;
++
++/**
++ * 由整曲响度与峰值算恒定增益
++ *
++ * 先按目标响度算需要的增益，再用真峰值余量压一次：抬升不能让峰值越过上限，
++ * 否则限幅器会削掉瞬态，反而破坏「相对音量恒定」的初衷。
++ * @param lufs - 整曲积分响度（LUFS）
++ * @param peakDb - 整曲峰值电平（dBFS）
++ * @param targetLufs - 目标响度（LUFS）
++ * @returns 恒定增益（dB），已钳制在 ±MACRO_GAIN_LIMIT_DB 内
++ */
++export const computeGainDb = (lufs: number, peakDb: number, targetLufs: number): number => {
++  const desired = targetLufs - lufs;
++  const peakRoom = MACRO_PEAK_CEILING_DB - peakDb;
++  const bounded = Math.min(desired, peakRoom);
++  return Math.max(-MACRO_GAIN_LIMIT_DB, Math.min(MACRO_GAIN_LIMIT_DB, bounded));
++};
+diff --git a/src/services/loudness/index.ts b/src/services/loudness/index.ts
+new file mode 100644
+index 0000000..2d1fe3f
+--- /dev/null
++++ b/src/services/loudness/index.ts
+@@ -0,0 +1,304 @@
++/**
++ * 宏音量（整曲恒定增益）
++ *
++ * 与「音量均衡」的实时 AGC 不同：每首歌只测一次整曲积分响度，之后整首歌都用
++ * 同一个恒定增益，因此不会出现段内忽大忽小。校准结果落本地，下次直接读取。
++ *
++ * 未校准的曲目先按 0dB 播放，等到缓存文件可读时在后台测量，下一次播放生效。
++ */
++
++import localforage from "localforage";
++import type { PlaybackContext, Track } from "@shared/types/player";
++import { useMediaStore } from "@/stores/media";
++import { useSettingsStore } from "@/stores/settings";
++import { cacheKeyForTrack, resolveTrackSource } from "@/services/audioSource";
++import * as cacheScheduler from "@/services/cacheScheduler";
++import { getNextTrackCandidate } from "@/core/player/candidate";
++import { useStatusStore } from "@/stores/status";
++import * as queue from "@/stores/queue";
++import { LOUDNESS_ALGO_VERSION, measureUrl, type LoudnessMeasurement } from "./measure";
++import { computeGainDb } from "./gain";
++
++/** 校准结果存储：键为 `{source}:{id}` */
++const store = localforage.createInstance({ name: "splayer", storeName: "loudness" });
++
++/** 单曲校准记录 */
++interface LoudnessRecord extends LoudnessMeasurement {
++  /** 算法版本，版本不同视为未校准 */
++  algo: number;
++  /** 测量完成时间 */
++  measuredAt: number;
++}
++
++/** 不参与宏音量对齐的来源类型：听整张专辑或播客时保持专辑内部动态 */
++const SKIP_ORIGIN_TYPES = new Set(["album", "radio"]);
++
++/** 正在测量的曲目键，避免重复测量 */
++const measuring = new Set<string>();
++
++/** 预校准进行中，同一时间只允许一条 */
++let premeasuring = false;
++
++/** 开播后等待多久再预校准下一首（毫秒） */
++const PREMEASURE_DELAY_MS = 8000;
++
++let premeasureTimer: ReturnType<typeof setTimeout> | null = null;
++
++/**
++ * 延迟为下一首做预校准
++ *
++ * 播放前无法判断用户是否会立刻跳过，这里等一小段时间、确认仍在这首歌上再动手。
++ * @param trackKey - 当前曲目键，用于确认没有换歌
++ */
++const schedulePremeasure = (trackKey: string): void => {
++  if (premeasureTimer) clearTimeout(premeasureTimer);
++  premeasureTimer = setTimeout(() => {
++    premeasureTimer = null;
++    const current = useMediaStore().track;
++    if (!current || keyForTrack(current) !== trackKey) return;
++    void premeasureNext();
++  }, PREMEASURE_DELAY_MS);
++};
++
++/** 曲目校准键 */
++const keyForTrack = (track: Track): string => `${track.source}:${track.id}`;
++
++/**
++ * 宏音量是否应作用于本次播放
++ * @param context - 本次播放的来源上下文
++ * @returns 是否参与对齐
++ */
++export const shouldApplyMacroVolume = (context?: PlaybackContext | null): boolean => {
++  const settings = useSettingsStore();
++  if (!settings.system.player.macroVolume?.enabled) return false;
++  // 专辑与播客内部本就有意设计的动态，强行对齐会破坏作品意图
++  if (context && SKIP_ORIGIN_TYPES.has(context.originType)) return false;
++  return true;
++};
++
++/**
++ * 读取已存的校准结果
++ * @param track - 歌曲信息
++ * @returns 校准记录，未校准或算法版本过期时返回 null
++ */
++export const getMeasurement = async (track: Track): Promise<LoudnessMeasurement | null> => {
++  try {
++    const record = await store.getItem<LoudnessRecord>(keyForTrack(track));
++    if (!record || record.algo !== LOUDNESS_ALGO_VERSION) return null;
++    if (!Number.isFinite(record.lufs) || !Number.isFinite(record.peakDb)) return null;
++    return { lufs: record.lufs, peakDb: record.peakDb };
++  } catch (error) {
++    console.warn("[loudness] 读取校准结果失败", error);
++    return null;
++  }
++};
++
++/**
++ * 由测量结果计算恒定增益
++ * @param measurement - 整曲响度与峰值
++ * @returns 增益（dB），正负均可能
++ */
++export const gainFromMeasurement = (measurement: LoudnessMeasurement): number => {
++  const target = useSettingsStore().system.player.macroVolume?.targetLufs ?? -18;
++  return computeGainDb(measurement.lufs, measurement.peakDb, target);
++};
++
++/**
++ * 测量并保存一首歌的整曲响度
++ * @param track - 歌曲信息
++ * @returns 增益（dB），无法测量时返回 null
++ */
++export const measureTrack = async (track: Track): Promise<number | null> => {
++  const settings = useSettingsStore();
++  const key = cacheKeyForTrack(track, settings.player.songLevel);
++  if (!key) return null;
++  const existing = await getMeasurement(track);
++  if (existing) return gainFromMeasurement(existing);
++  const fileKey = keyForTrack(track);
++  if (measuring.has(fileKey)) return null;
++  measuring.add(fileKey);
++  try {
++    const url = await window.api.cache.song.url(key);
++    if (!url) return null;
++    const measurement = await measureUrl(url);
++    const record: LoudnessRecord = {
++      ...measurement,
++      algo: LOUDNESS_ALGO_VERSION,
++      measuredAt: Date.now(),
++    };
++    await store.setItem(fileKey, record);
++    console.info(
++      `[loudness] 校准完成 ${track.title ?? track.id} ${measurement.lufs.toFixed(1)}LUFS peak=${measurement.peakDb.toFixed(1)}dB`,
++    );
++    return gainFromMeasurement(measurement);
++  } catch (error) {
++    console.warn(`[loudness] 校准失败 ${track.title ?? track.id}`, error);
++    return null;
++  } finally {
++    measuring.delete(fileKey);
++  }
++};
++
++/** 校准轮询的间隔（毫秒） */
++const CALIBRATION_POLL_MS = 2000;
++
++/** 校准轮询的最大次数（约 2 分钟，覆盖整首缓存下载） */
++const CALIBRATION_POLL_LIMIT = 60;
++
++/** 正在等待校准的曲目键，避免重复开轮询 */
++let calibratingKey: string | null = null;
++let calibratingTimer: ReturnType<typeof setInterval> | null = null;
++
++/** 停止校准轮询 */
++const stopCalibrationPoll = (): void => {
++  if (calibratingTimer) clearInterval(calibratingTimer);
++  calibratingTimer = null;
++  calibratingKey = null;
++};
++
++/**
++ * 边播边等缓存落地，测到就立刻把增益应用到当前曲目
++ *
++ * 未缓存的曲目在开播时拿不到音频，只能等缓存下载完成；测到后中途生效，
++ * 下一遍播放就能从第一个采样开始对齐。切歌会中止上一条轮询。
++ * @param track - 需要校准的曲目
++ */
++const watchCalibration = (track: Track): void => {
++  const key = keyForTrack(track);
++  if (calibratingKey === key) return;
++  stopCalibrationPoll();
++  calibratingKey = key;
++  let attempts = 0;
++  let settled = false;
++  const stop = (): void => {
++    settled = true;
++    stopCalibrationPoll();
++  };
++  const poll = async (): Promise<void> => {
++    if (settled) return;
++    attempts++;
++    const current = useMediaStore().track;
++    if (!current || keyForTrack(current) !== key || !settingsEnabled()) {
++      stop();
++      return;
++    }
++    // 20 秒阈值对宏音量太晚，这里直接催一次缓存下载
++    cacheScheduler.triggerNow();
++    const gain = await measureTrack(track);
++    if (gain !== null) {
++      stop();
++      const stillCurrent = useMediaStore().track;
++      if (stillCurrent && keyForTrack(stillCurrent) === key) {
++        await window.api.player.setMacroGain(gain);
++        console.info(`[loudness] 中途校准生效 ${track.title ?? track.id} ${gain.toFixed(2)}dB`);
++      }
++      return;
++    }
++    if (attempts >= CALIBRATION_POLL_LIMIT) stop();
++  };
++  calibratingTimer = setInterval(() => void poll(), CALIBRATION_POLL_MS);
++  void poll();
++};
++
++/** 宏音量开关当前是否打开 */
++const settingsEnabled = (): boolean =>
++  useSettingsStore().system.player.macroVolume?.enabled === true;
++
++/**
++ * 在播放前应用当前曲目的宏音量增益
++ *
++ * 只写增益，不改播放状态。已校准的曲目在开播前就设好，未校准的先按 0dB
++ * 播放并在缓存落地后中途生效，下一遍播放即从第一个采样起对齐。
++ * @param track - 即将播放的歌曲
++ * @param context - 本次播放的来源上下文
++ */
++export const applyMacroVolume = async (
++  track: Track | null,
++  context?: PlaybackContext | null,
++): Promise<void> => {
++  if (!track || !shouldApplyMacroVolume(context)) {
++    stopCalibrationPoll();
++    await window.api.player.setMacroGain(0);
++    return;
++  }
++  const measurement = await getMeasurement(track);
++  if (!measurement) {
++    await window.api.player.setMacroGain(0);
++    console.info(
++      `[loudness] 未校准，先按 0dB 播放 ${track.title ?? track.id}（缓存落地后中途生效）`,
++    );
++    watchCalibration(track);
++    return;
++  }
++  const gain = gainFromMeasurement(measurement);
++  stopCalibrationPoll();
++  await window.api.player.setMacroGain(gain);
++  console.info(`[loudness] 已对齐 ${track.title ?? track.id} ${gain.toFixed(2)}dB`);
++  schedulePremeasure(keyForTrack(track));
++};
++
++/**
++ * 提前校准下一首
++ *
++ * 队列里下一首如果等到开播才测量，前十几秒仍是未对齐的；这里在当前曲目校准完成后
++ * 顺手把下一首的缓存拉下来并测掉，代价是一首歌的缓存流量（缓存已开启时本来也要下载）。
++ */
++const premeasureNext = async (): Promise<void> => {
++  if (premeasuring) return;
++  const status = useStatusStore();
++  const next = getNextTrackCandidate({
++    playIndex: status.playIndex,
++    queue: queue.queue.value,
++    fmMode: status.fmMode,
++    skipKeywordsSongs: false,
++    skipTrackKeywords: [],
++    shuffleMode: status.shuffleMode,
++  });
++  if (!next) return;
++  const track = next.track;
++  if (await getMeasurement(track)) return;
++  const key = keyForTrack(track);
++  if (measuring.has(key)) return;
++  premeasuring = true;
++  measuring.add(key);
++  try {
++    const settings = useSettingsStore();
++    const cacheKey = cacheKeyForTrack(track, settings.player.songLevel);
++    if (!cacheKey) return;
++    // 还没缓存就先按播放时会走的同一套流程拉一份
++    let url = await window.api.cache.song.url(cacheKey);
++    if (!url) {
++      const source = await resolveTrackSource(track, { silent: true });
++      if (!source?.cacheRequest) return;
++      await source.cacheRequest();
++      url = await window.api.cache.song.url(cacheKey);
++    }
++    if (!url) return;
++    const measurement = await measureUrl(url);
++    await store.setItem(key, {
++      ...measurement,
++      algo: LOUDNESS_ALGO_VERSION,
++      measuredAt: Date.now(),
++    } satisfies LoudnessRecord);
++    console.info(`[loudness] 预校准 ${track.title ?? track.id} ${measurement.lufs.toFixed(1)}LUFS`);
++  } catch (error) {
++    console.warn(`[loudness] 预校准失败 ${track.title ?? track.id}`, error);
++  } finally {
++    measuring.delete(key);
++    premeasuring = false;
++  }
++};
++
++/** 关闭宏音量时立刻把增益归零 */
++export const clearMacroVolume = (): void => {
++  void window.api.player.setMacroGain(0);
++};
++
++/** 清空全部校准结果（切换目标响度或手动重新校准用） */
++export const clearMeasurements = async (): Promise<void> => {
++  try {
++    await store.clear();
++  } catch (error) {
++    console.warn("[loudness] 清空校准结果失败", error);
++  }
++};
+diff --git a/src/services/loudness/measure.ts b/src/services/loudness/measure.ts
+new file mode 100644
+index 0000000..afa9037
+--- /dev/null
++++ b/src/services/loudness/measure.ts
+@@ -0,0 +1,236 @@
++/**
++ * 整曲响度测量（EBU R128 / ITU-R BS.1770-4）
++ *
++ * 用 Web Audio 解码缓存文件拿 PCM，再按标准做 K 加权与门限积分，
++ * 得到整曲的积分响度（LUFS）与峰值电平（dBFS）。
++ * 结果用于给每首歌算一个恒定的校准增益，使不同歌曲的相对音量一致。
++ */
++
++/** 测量结果 */
++export interface LoudnessMeasurement {
++  /** 积分响度（LUFS） */
++  lufs: number;
++  /** 峰值电平（dBFS，样本峰值） */
++  peakDb: number;
++}
++
++/**
++ * 算法版本
++ *
++ * 结果里不带版本号就无法分辨旧数据是否还适用，改动算法时递增即可整体重测
++ */
++export const LOUDNESS_ALGO_VERSION = 1;
++
++/** 绝对门限（LUFS），低于此值的块直接丢弃 */
++const ABSOLUTE_GATE_LUFS = -70;
++
++/** 相对门限偏移（LU），相对门限 = 通过绝对门限的块响度 - 该值 */
++const RELATIVE_GATE_LU = -10;
++
++/** 积分块时长（毫秒） */
++const BLOCK_MS = 400;
++
++/** 积分块重叠比例（75% 重叠 → 步长 100ms） */
++const BLOCK_STEP_RATIO = 0.25;
++
++/** 双通道下混到单声道的电平补偿（避免响度整体偏低） */
++const MONO_MIX_GAIN = Math.SQRT2;
++
++/**
++ * 一阶高通 + 高架滤波器（K 加权）
++ *
++ * 系数按采样率现算，48kHz 时与 BS.1770 给出的常数一致
++ */
++interface BiquadCoefficients {
++  b0: number;
++  b1: number;
++  b2: number;
++  a1: number;
++  a2: number;
++}
++
++/**
++ * 计算 K 加权第一级（高架，+4dB @ 1.5kHz 附近）系数
++ * @param sampleRate - 采样率（Hz）
++ * @returns 双二阶级联的第一级系数
++ */
++const highShelfCoefficients = (sampleRate: number): BiquadCoefficients => {
++  const f0 = 1681.974450955533;
++  const gainDb = 3.999843853973347;
++  const q = 0.7071752369554196;
++  const k = Math.tan((Math.PI * f0) / sampleRate);
++  const vh = Math.pow(10, gainDb / 20);
++  const vb = Math.pow(vh, 0.4996667741545416);
++  const a0 = 1 + k / q + k * k;
++  return {
++    b0: (vh + (vb * k) / q + k * k) / a0,
++    b1: (2 * (k * k - vh)) / a0,
++    b2: (vh - (vb * k) / q + k * k) / a0,
++    a1: (2 * (k * k - 1)) / a0,
++    a2: (1 - k / q + k * k) / a0,
++  };
++};
++
++/**
++ * 计算 K 加权第二级（高通，38Hz 附近）系数
++ * @param sampleRate - 采样率（Hz）
++ * @returns 双二阶级联的第二级系数
++ */
++const highPassCoefficients = (sampleRate: number): BiquadCoefficients => {
++  const f0 = 38.13547087602444;
++  const q = 0.5003270373238773;
++  const k = Math.tan((Math.PI * f0) / sampleRate);
++  const a0 = 1 + k / q + k * k;
++  return {
++    b0: 1,
++    b1: -2,
++    b2: 1,
++    a1: (2 * (k * k - 1)) / a0,
++    a2: (1 - k / q + k * k) / a0,
++  };
++};
++
++/**
++ * 就地应用双二阶级联（Direct Form II Transposed）
++ * @param samples - 单声道样本，就地修改
++ * @param first - 第一级系数
++ * @param second - 第二级系数
++ */
++const applyKWeighting = (
++  samples: Float32Array,
++  first: BiquadCoefficients,
++  second: BiquadCoefficients,
++): void => {
++  let z1 = 0;
++  let z2 = 0;
++  for (let i = 0; i < samples.length; i++) {
++    const x = samples[i];
++    const y = first.b0 * x + z1;
++    z1 = first.b1 * x - first.a1 * y + z2;
++    z2 = first.b2 * x - first.a2 * y;
++    samples[i] = y;
++  }
++  z1 = 0;
++  z2 = 0;
++  for (let i = 0; i < samples.length; i++) {
++    const x = samples[i];
++    const y = second.b0 * x + z1;
++    z1 = second.b1 * x - second.a1 * y + z2;
++    z2 = second.b2 * x - second.a2 * y;
++    samples[i] = y;
++  }
++};
++
++/**
++ * 把多声道缓冲下混成单声道
++ * @param buffer - 解码得到的音频缓冲
++ * @returns 单声道样本
++ */
++const toMono = (buffer: AudioBuffer): Float32Array => {
++  const channelCount = buffer.numberOfChannels;
++  const mono = new Float32Array(buffer.length);
++  for (let c = 0; c < channelCount; c++) {
++    const channel = buffer.getChannelData(c);
++    for (let i = 0; i < channel.length; i++) mono[i] += channel[i];
++  }
++  const scale = MONO_MIX_GAIN / channelCount;
++  for (let i = 0; i < mono.length; i++) mono[i] *= scale;
++  return mono;
++};
++
++/**
++ * 计算样本峰值电平
++ * @param buffer - 解码得到的音频缓冲
++ * @returns 峰值电平（dBFS），静音时返回 -Infinity
++ */
++const peakDbOf = (buffer: AudioBuffer): number => {
++  let peak = 0;
++  for (let c = 0; c < buffer.numberOfChannels; c++) {
++    const channel = buffer.getChannelData(c);
++    for (let i = 0; i < channel.length; i++) {
++      const value = Math.abs(channel[i]);
++      if (value > peak) peak = value;
++    }
++  }
++  return peak > 0 ? 20 * Math.log10(peak) : Number.NEGATIVE_INFINITY;
++};
++
++/**
++ * 按 BS.1770-4 计算积分响度
++ * @param mono - 单声道样本（已做 K 加权）
++ * @param sampleRate - 采样率（Hz）
++ * @returns 积分响度（LUFS），无可测内容时返回 -Infinity
++ */
++const integratedLufs = (mono: Float32Array, sampleRate: number): number => {
++  const blockLength = Math.max(1, Math.round((BLOCK_MS / 1000) * sampleRate));
++  const step = Math.max(1, Math.round(blockLength * BLOCK_STEP_RATIO));
++  const blockCount = Math.floor((mono.length - blockLength) / step) + 1;
++  if (blockCount <= 0) {
++    // 曲子比一个积分块还短，退化成整段均值
++    let sum = 0;
++    for (let i = 0; i < mono.length; i++) sum += mono[i] * mono[i];
++    const meanSquare = mono.length > 0 ? sum / mono.length : 0;
++    return meanSquare > 0 ? -0.691 + 10 * Math.log10(meanSquare) : Number.NEGATIVE_INFINITY;
++  }
++  const blockLoudness = new Float64Array(blockCount);
++  for (let b = 0; b < blockCount; b++) {
++    const start = b * step;
++    let sum = 0;
++    for (let i = 0; i < blockLength; i++) {
++      const value = mono[start + i];
++      sum += value * value;
++    }
++    const meanSquare = sum / blockLength;
++    blockLoudness[b] =
++      meanSquare > 0 ? -0.691 + 10 * Math.log10(meanSquare) : Number.NEGATIVE_INFINITY;
++  }
++  // 绝对门限
++  let sumGated = 0;
++  let gatedCount = 0;
++  for (let b = 0; b < blockCount; b++) {
++    if (blockLoudness[b] <= ABSOLUTE_GATE_LUFS) continue;
++    sumGated += Math.pow(10, blockLoudness[b] / 10);
++    gatedCount++;
++  }
++  if (gatedCount === 0) return Number.NEGATIVE_INFINITY;
++  const absoluteGatedLufs = 10 * Math.log10(sumGated / gatedCount);
++  // 相对门限
++  const relativeGate = absoluteGatedLufs + RELATIVE_GATE_LU;
++  let sumRelative = 0;
++  let relativeCount = 0;
++  for (let b = 0; b < blockCount; b++) {
++    if (blockLoudness[b] <= ABSOLUTE_GATE_LUFS || blockLoudness[b] <= relativeGate) continue;
++    sumRelative += Math.pow(10, blockLoudness[b] / 10);
++    relativeCount++;
++  }
++  if (relativeCount === 0) return absoluteGatedLufs;
++  return 10 * Math.log10(sumRelative / relativeCount);
++};
++
++/**
++ * 测量一个音频文件的整曲响度
++ * @param url - 可解码的音频地址（缓存文件走 cache:// 协议）
++ * @returns 积分响度与峰值；地址不可达或无法解码时抛错
++ */
++export const measureUrl = async (url: string): Promise<LoudnessMeasurement> => {
++  const response = await fetch(url);
++  if (!response.ok) throw new Error(`响度测量取样失败: HTTP ${response.status}`);
++  const data = await response.arrayBuffer();
++  if (data.byteLength === 0) throw new Error("响度测量取样为空");
++  const context = new AudioContext();
++  try {
++    const buffer = await context.decodeAudioData(data);
++    const peakDb = peakDbOf(buffer);
++    const mono = toMono(buffer);
++    applyKWeighting(
++      mono,
++      highShelfCoefficients(buffer.sampleRate),
++      highPassCoefficients(buffer.sampleRate),
++    );
++    const lufs = integratedLufs(mono, buffer.sampleRate);
++    if (!Number.isFinite(lufs)) throw new Error("响度测量无有效内容");
++    return { lufs, peakDb: Number.isFinite(peakDb) ? peakDb : -120 };
++  } finally {
++    void context.close();
++  }
++};
+diff --git a/src/services/playback.ts b/src/services/playback.ts
+index 3e76aa9..0ef091d 100644
+--- a/src/services/playback.ts
++++ b/src/services/playback.ts
+@@ -46,6 +46,23 @@ const SYNC_TOLERANCE_MS = 1000;
+  */
+ const SYNC_CONVERGE_RATE = 0.2;
+ 
++/**
++ * 最近一次主进程位置推送的本地时间戳
++ *
++ * 主窗口隐藏期间位置推送会停发，恢复后渲染端需要判断推送是否真的回来了，
++ * 因此单独记录到达时刻供停滞检测使用
++ */
++let lastPushAt = 0;
++
++/** 记录一次主进程位置推送 */
++export const notePositionPush = (): void => {
++  lastPushAt = performance.now();
++};
++
++/** 距最近一次位置推送的毫秒数；从未收到推送时返回 Infinity */
++export const getMsSinceLastPush = (): number =>
++  lastPushAt > 0 ? performance.now() - lastPushAt : Number.POSITIVE_INFINITY;
++
+ /** 获取当前播放位置（毫秒），播放中按 speed 插值，seek 中冻结 */
+ export const getCurrentTime = (): number => {
+   if (!playing || seeking) return currentTimeMs;
+@@ -133,6 +150,7 @@ export const reset = (): void => {
+   currentTimeMs = 0;
+   totalDurationMs = 0;
+   lastSyncAt = 0;
++  lastPushAt = 0;
+   playing = false;
+   seeking = false;
+   resyncPending = false;
+diff --git a/src/settings/categories/player.ts b/src/settings/categories/player.ts
+index f3fc8d2..ecd7546 100644
+--- a/src/settings/categories/player.ts
++++ b/src/settings/categories/player.ts
+@@ -66,6 +66,67 @@ const playerCategory: SettingCategory = {
+           binding: { store: "settings", path: "system.player.loudnessNormalization" },
+           defaultValue: false,
+           tag: { text: "Beta" },
++          // 实时 AGC 会把宏音量对齐好的增益又拉回自己的目标，两者互斥
++          confirm: {
++            when: (next) =>
++              Boolean(next) && Boolean(useSettingsStore().system.player.macroVolume?.enabled),
++            titleKey: "settings.confirm.loudnessExclusiveTitle",
++            contentKey: "settings.confirm.loudnessExclusiveContent",
++            type: "warning",
++          },
++          action: async (enabled) => {
++            if (!enabled) return;
++            const settings = useSettingsStore();
++            if (settings.system.player.macroVolume?.enabled) {
++              await settings.setSystem("player.macroVolume.enabled", false);
++            }
++          },
++        },
++        {
++          key: "macroVolume",
++          type: "switch",
++          binding: { store: "settings", path: "system.player.macroVolume.enabled" },
++          defaultValue: false,
++          tag: { text: "Beta" },
++          // 宏音量要用缓存文件做整曲测量，且与实时 AGC 互斥
++          confirm: {
++            when: (next) => {
++              if (!next) return false;
++              const current = useSettingsStore();
++              return (
++                !current.system.cache.songCache.enabled ||
++                Boolean(current.system.player.loudnessNormalization)
++              );
++            },
++            titleKey: "settings.confirm.macroVolumeCacheTitle",
++            contentKey: "settings.confirm.macroVolumeCacheContent",
++            type: "warning",
++          },
++          action: async (enabled) => {
++            if (!enabled) return;
++            const settings = useSettingsStore();
++            if (!settings.system.cache.songCache.enabled) {
++              await settings.setSystem("cache.songCache.enabled", true);
++            }
++            if (!settings.system.cache.songCache.cacheStreaming) {
++              await settings.setSystem("cache.songCache.cacheStreaming", true);
++            }
++            if (settings.system.player.loudnessNormalization) {
++              await settings.setSystem("player.loudnessNormalization", false);
++            }
++          },
++          children: [
++            {
++              key: "macroVolumeTarget",
++              type: "slider",
++              binding: { store: "settings", path: "system.player.macroVolume.targetLufs" },
++              min: -23,
++              max: -14,
++              step: 1,
++              defaultValue: -18,
++              marks: { "-23": "-23", "-18": "-18", "-14": "-14" },
++            },
++          ],
+         },
+       ],
+     },
+-- 
+2.53.0
+

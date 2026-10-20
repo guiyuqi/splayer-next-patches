@@ -76,6 +76,49 @@
   - 播客**没有**单集进度记忆、已听标记、跳过片头片尾（前身 SPlayer 也没有）。
   - 分类详情页只取首批 30 条，没有触底分页。
 
+## 0009 feat：宏音量对齐 + 窗口唤醒后的播放/歌词恢复（A，⚠️ 仅 JS 层）
+
+这一批与 0001~0008 无重叠：那批是播客/MCP/歌词显示，这批是**音量一致性与"回到前台后播放状态恢复"**。
+
+### 新增：宏音量对齐（整曲恒定增益）
+
+- **问题**：不同歌曲母带响度差异极大（实测同一歌单里 `-5.2 LUFS` 与 `-17.5 LUFS` 共存，差 12 dB），调一次音量没法同时听。原有「音量均衡」是**实时 AGC**，会随内容不断改增益，反而造成段内忽大忽小（见 `AUDIO-NORMALIZATION-ANALYSIS.md` 那类问题）。
+- **做法**：
+  - 测量在**渲染端**：`cache://` 协议带 `supportFetchAPI`，直接 `fetch` 已缓存的音频 → Web Audio `decodeAudioData` → 按 **ITU-R BS.1770-4 / EBU R128** 做 K 加权、400ms 分块 75% 重叠、绝对门限 −70 LUFS + 相对门限 −10 LU 的积分，外加样本峰值。纯 TS，`src/services/loudness/{measure,gain,index}.ts`。
+  - 增益：`clamp(min(目标响度 − 实测, -1 dBTP − 峰值), ±12 dB)`，目标默认 **−18 LUFS**（设置里可调 −23…−14），有单测覆盖"抬升被峰值余量压住"和"钳制在前级范围"。
+  - 施加：引擎没有独立增益入口，用**均衡器前级** —— `dsp/equalizer.rs` 里 `gain_db = 0` 时滤波器系数退化为逐采样直通，所以「开均衡器 + 全频段 0dB + 只改前级」等价于整曲乘一个常数；且 `eq_enabled=true` 会启用 `dsp/limiter.rs` 的限幅器（ceiling 0.98），顺带做削波保护。组合规则（用户前级 + 宏增益、均衡器开关）只在主进程算，避免设置页与宏音量互相覆盖。
+  - 校准结果存渲染端 IndexedDB（`splayer/loudness`，键 `{source}:{id}`，带算法版本号），下次播放直接读。
+  - 首次播放：没缓存就拿不到整首音频，先按 0dB 播；`cacheScheduler.triggerNow()` 立刻催缓存，`watchCalibration()` 每 2s 试一次，测到就**中途生效**；并对**队列下一首**做延迟预校准，使第二首起从头就准。
+  - 场景门控：`playbackContext.originType` 为 `album` / `radio` 时不参与对齐（保留专辑与播客自身的动态）。
+  - 与旧「音量均衡」三层互斥：设置页互相确认并关闭、主进程 `applyConfigChange` 双向清除、运行时 `ensureNormalizationOff()` 兜底。旧开关标注为「已由宏音量对齐取代，建议关闭」。
+- **验证（真机）**：日志可见 `校准完成 とある一家の御茶会議 -5.2LUFS peak=2.1dB` → `宏音量增益已应用: -12.00dB`（撞到 ±12 上限）与 `ツギハギスタッカート -9.5LUFS` → `-8.54dB`；用户主观确认"两首音量相差很大的歌"对齐后听感一致。缓存目录与校准库均在本机生成。
+- **⚠️ 未验证 / 限制**：
+  - **本地文件**（`track.source === "local"`）不参与（渲染端拿不到可 fetch 的 `file://`）。
+  - 峰值用的是**样本峰值**，不是 4× 过采样的真峰值；已用 −1 dBTP 上限留余量，但对强限幅母带可能仍有极少量瞬态被限幅器吃掉。
+  - LUFS 是**长时平均**：压得很猛的歌对齐后短时仍显得更响，这是标准本身的局限，本补丁不引入 LUFS-S 之类的短时约束。
+  - 首次播放某首未缓存的歌，会有约 5~20 秒的"未对齐"窗口（等缓存 + 解码测量）。
+  - 只在网易云在线流媒体 + 一首歌单的样本上量过，没有全库回归。
+
+### 修复：最小化/隐藏后回来，进度条不动、歌词冻结在最开始
+
+- **根因（真机日志定位，非猜测）**：渲染端 `seekTarget` 是一道**没有超时的永久屏蔽** —— `hasReachedSeekTarget()` 只在后端推送位置落在目标 ±1s 内才清除；一次"跳到 0"的 seek 若引擎实际在 84 秒处继续播放，就永远到不了目标，之后**每条 `position` 推送都被丢弃**，于是进度条停在 0:00、歌词停在第一行。实测日志：`[player] 解除卡住的 seek 屏蔽 target=0` + `播放状态已对账(seek-stall) state=playing pos=84462`。
+- **改法**：
+  - `seekTarget` 加 3s 超时自动解除；`resyncFromEngine()` 以引擎快照为权威，卡住的屏蔽一并解除并重新锚定。
+  - 新增 3s 位置停滞看门狗（2s 巡检，`document.hidden` 时跳过），用 `player:getStatus` 对账。
+  - 主进程 `pushPlaybackSnapshot()`：窗口 `focus` / `show` / `restore` / 系统唤醒后补发快照（隐藏期间高频推送按约定跳过，恢复时补一次），**不触发播放**。
+- **验证（真机）**：用户实测"冻结现在被正常唤醒了"；日志有 `主窗口恢复可见，已补发播放快照（focus）`、`[lyric] 窗口恢复…`。
+
+### 修复：歌词页唤醒后仍然冻结
+
+- **根因**：`lyric-dom` 的 `freeze()` 会 `cancelAnimationFrame` 并把 `animationFrameId` 置 0，只有 `resume()` 能救；而 `resume()` 只挂在展开过渡的 `after-enter` 上——窗口在后台时过渡整段跑在无帧环境里，`after-enter` 可能不触发。另外引擎内部缓存 `isPageVisible`，只由它自己的 `visibilitychange` 监听更新。
+- **改法**：唤醒时 `resume()`（库自带 `animationFrameId !== 0` 幂等保护）+ 补发一次合成的 `visibilitychange`（防重入）+ 重锚时钟；展开/收起改由 `watch(isPlayerExpanded)` 驱动 `resume + startTick` / `freeze + stopTick`，不再依赖过渡钩子；推进时钟**不再被加载标记门卡死**；`usePlaybackTime` 先续帧再回调 + try/catch，异常不会断掉帧链。
+- **验证（真机）**：用户实测通过。
+
+### 其它
+
+- 渲染端 console 转发进主进程日志（`(renderer)` 前缀），生产包没有 devtools 时也能回溯；位置推送被丢弃时按 5s 节流记录拦截原因（`位置推送被丢弃(trackLoading|seekTarget)`）。
+- 新增单测 `src/services/loudness/gain.spec.ts`；`vitest` 249 / `tsx --test` 35 全绿，`prettier` / `eslint` / `tsc` / `vue-tsc` 通过。
+
 ---
 
 ## 有意排除的内容
